@@ -1,0 +1,272 @@
+#!/bin/sh
+# vpn-portal-login: get through a hotel or public Wi-Fi login page from the
+# router itself, so devices on the LAN stay behind the kill switch.
+#
+#   vpn-portal-login            try to log in; exit 0 once the uplink is online
+#   vpn-portal-login capture    only save the portal's pages for later
+#
+# It knows a few portal systems (Meraki, Cisco WLC, OPNsense, MikroTik trial)
+# and otherwise fills in the page's form: ticks the terms box, keeps hidden
+# fields, and enters surname, room and e-mail from /etc/config/vpnregions.
+# A portal it can't get through is saved under /root/portal-captures, so a
+# login for it can be written later.
+
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+MODE="$1"
+[ -n "$VPN_TEST" ] || . /lib/functions.sh
+
+PROBE="${VPN_PROBE:-http://detectportal.firefox.com/success.txt}"   # answers "success"
+CAPDIR="${VPN_CAPDIR:-/root/portal-captures}"
+KEEP=10                       # captures kept
+WORK="${VPN_WORK:-/tmp/vpn-portal-login}"
+DNSAUTO="/tmp/resolv.conf.d/resolv.conf.auto"
+UA="Mozilla/5.0 (X11; Linux x86_64; rv:144.0) Gecko/20100101 Firefox/144.0"
+
+if [ -n "$VPN_TEST" ]; then
+  UPLINK=wwan; SURNAME="$VPN_SURNAME"; ROOM="$VPN_ROOM"; EMAIL="$VPN_EMAIL"
+  dev="$VPN_DEV"; ssid=test; bssid=test
+else
+  config_load vpnregions
+  config_get UPLINK main uplink wwan
+  config_get SURNAME main portal_surname ""
+  config_get ROOM main portal_room ""
+  config_get EMAIL main portal_email ""
+  dev="$(ifstatus "$UPLINK" 2>/dev/null | jsonfilter -e '@.l3_device')"
+  ssid="$(iwinfo "$dev" info 2>/dev/null | sed -n 's/.*ESSID: "\(.*\)".*/\1/p')"
+  bssid="$(iwinfo "$dev" info 2>/dev/null | sed -n 's/.*Access Point: \([0-9A-Fa-f:]*\).*/\1/p')"
+fi
+[ -n "$dev" ] || { echo "uplink is not connected"; exit 1; }
+
+log() { [ -n "$VPN_TEST" ] && echo "LOG $*" >&2 || logger -t vpn-portal-login "$*"; echo "# $*" >> "$WORK/trace"; }
+
+rm -rf "$WORK"; mkdir -p "$WORK"
+JAR="$WORK/cookies"; : > "$JAR"; : > "$WORK/trace"; : > "$WORK/urls"
+
+# The uplink's own DNS server, asked directly: dnsmasq may be pointed at the
+# VPN's DNS, and its rebind protection hides portals on private addresses.
+updns="$(awk -v i="$UPLINK" '/^# Interface /{c=$3} /^nameserver/ && c==i {print $2; exit}' "$DNSAUTO" 2>/dev/null)"
+
+resolve() {
+  case "$1" in *[!0-9.]*) ;; *) echo "$1"; return ;; esac
+  [ -n "$updns" ] || return
+  nslookup "$1" "$updns" 2>/dev/null |
+    awk '/^Name:/{n=1} n && /^Address/ {sub(/^Address[^:]*: */,""); if ($1 ~ /^[0-9.]+$/) {print $1; exit}}'
+}
+
+urlhost() { echo "$1" | sed -n 's#^[A-Za-z]*://\([^/:?]*\).*#\1#p'; }
+urlport() {
+  p="$(echo "$1" | sed -n 's#^[A-Za-z]*://[^/:?]*:\([0-9]*\).*#\1#p')"
+  [ -n "$p" ] && echo "$p" || case "$1" in https:*) echo 443 ;; *) echo 80 ;; esac
+}
+origin() { echo "$1" | sed -n 's#^\([A-Za-z]*://[^/?]*\).*#\1#p'; }
+
+# absolute URL for a link $2 found on page $1
+absurl() {
+  case "$2" in
+    http://*|https://*) echo "$2" ;;
+    //*) echo "${1%%:*}:$2" ;;
+    /*) echo "$(origin "$1")$2" ;;
+    "") echo "${1%%#*}" ;;
+    \?*) echo "${1%%\?*}$2" ;;
+    *) b="${1%%\?*}"; echo "${b%/*}/$2" ;;
+  esac
+}
+
+urldecode() {
+  echo "$1" | awk 'BEGIN { for (i = 0; i < 256; i++) h[sprintf("%02X", i)] = sprintf("%c", i) }
+    { gsub(/\+/, " "); r = ""; while (match($0, /%[0-9A-Fa-f][0-9A-Fa-f]/)) {
+        r = r substr($0, 1, RSTART - 1) h[toupper(substr($0, RSTART + 1, 2))]; $0 = substr($0, RSTART + 3) }
+      print r $0 }'
+}
+urlencode() { printf '%s' "$1" | awk 'BEGIN{for(i=0;i<256;i++)o[sprintf("%c",i)]=i} {s=(NR>1?"%0A":""); for(i=1;i<=length($0);i++){c=substr($0,i,1); s=s (c~/[A-Za-z0-9._~-]/?c:sprintf("%%%02X",o[c]))} printf "%s",s}'; }
+qparam() { echo "$1" | sed -n "s/.*[?&]$2=\([^&#]*\).*/\1/p"; }
+
+# fetch URL [POSTDATA]: follow redirects by hand (each host resolved through
+# the uplink's DNS), log everything for a capture, leave the final page in
+# $WORK/page and its address in $URL.
+fetch() {
+  url="$1"; data="$2"; n=0
+  while :; do
+    n=$((n + 1)); host="$(urlhost "$url")"; port="$(urlport "$url")"; ip="$(resolve "$host")"
+    set -- -sk -m 15 --interface "$dev" -A "$UA" -b "$JAR" -c "$JAR" -D "$WORK/hdr" -o "$WORK/page"
+    [ -n "$ip" ] && [ "$ip" != "$host" ] && set -- "$@" --resolve "$host:$port:$ip"
+    [ -n "$data" ] && set -- "$@" --data "$data" -H "Content-Type: application/x-www-form-urlencoded"
+    code="$(curl "$@" -w '%{http_code}' "$url" 2>/dev/null)"
+    { echo; echo "== $([ -n "$data" ] && echo POST || echo GET) $url -> $code"; [ -n "$data" ] && echo "-- data: $data"
+      cat "$WORK/hdr" 2>/dev/null; head -c 60000 "$WORK/page" 2>/dev/null; echo; } >> "$WORK/trace"
+    echo "$url" >> "$WORK/urls"
+    URL="$url"; CODE="$code"
+    loc="$(sed -n 's/^[Ll]ocation: *\(.*\)\r*$/\1/p' "$WORK/hdr" 2>/dev/null | tr -d '\r' | tail -n 1)"
+    case "$code" in 30[1278]) ;; *) return 0 ;; esac
+    [ -n "$loc" ] && [ "$n" -lt 10 ] || return 0
+    url="$(absurl "$url" "$loc")"
+    [ "$code" = 307 ] || [ "$code" = 308 ] || data=""
+  done
+}
+
+online() {
+  curl -sk -m 10 --interface "$dev" -o "$WORK/probe" "$PROBE" 2>/dev/null &&
+    [ "$(tr -d ' \r\n' < "$WORK/probe")" = success ]
+}
+
+# meta refresh or a JavaScript redirect on the current page
+softredirect() {
+  tr '\n\r' '  ' < "$WORK/page" | awk '{
+    l=tolower($0)
+    if (match(l, /http-equiv=["'"'"']?refresh["'"'"']?[^>]*url=[^"'"'"'>]+/)) { s=substr($0,RSTART,RLENGTH); sub(/.*[Uu][Rr][Ll]=/,"",s); print s; exit }
+    if (match($0, /(window\.|document\.|top\.)?location(\.href)? *= *["'"'"'][^"'"'"']+/)) { s=substr($0,RSTART,RLENGTH); sub(/^[^"'"'"']*["'"'"']/,"",s); print s; exit }
+    if (match($0, /location\.replace\( *["'"'"'][^"'"'"']+/)) { s=substr($0,RSTART,RLENGTH); sub(/^[^"'"'"']*["'"'"']/,"",s); print s; exit }
+  }' | sed 's/&amp;/\&/g'
+}
+
+# Fill in the most promising form on the page. Prints "METHOD<TAB>action"
+# then the encoded body, or "NEED<TAB>field" when a required field can't be
+# filled.
+formfill() {
+  tr '\n\r\t' '   ' < "$WORK/page" | awk -v sn="$SURNAME" -v rm="$ROOM" -v em="$EMAIL" '
+  function attr(t, n,   l, s) {
+    l = tolower(t)
+    if (match(l, "[ \t]" n "[ \t]*=[ \t]*\"[^\"]*\"")) { s = substr(t, RSTART, RLENGTH); sub(/^[^"]*"/, "", s); sub(/"$/, "", s); return ent(s) }
+    if (match(l, "[ \t]" n "[ \t]*=[ \t]*\047[^\047]*\047")) { s = substr(t, RSTART, RLENGTH); sub(/^[^\047]*\047/, "", s); sub(/\047$/, "", s); return ent(s) }
+    if (match(l, "[ \t]" n "[ \t]*=[ \t]*[^ \t>\"\047]+")) { s = substr(t, RSTART, RLENGTH); sub(/^[^=]*=[ \t]*/, "", s); return ent(s) }
+    return ""
+  }
+  function has(t, n) { return match(tolower(t), "[ \t]" n "([ \t=/>]|$)") }
+  function ent(s) { gsub(/&amp;/, "\\&", s); gsub(/&quot;/, "\"", s); gsub(/&#0?39;/, "\047", s); gsub(/&lt;/, "<", s); gsub(/&gt;/, ">", s); return s }
+  function enc(s,   i, c, r) { r = ""; for (i = 1; i <= length(s); i++) { c = substr(s, i, 1); r = r (c ~ /[A-Za-z0-9._~-]/ ? c : sprintf("%%%02X", ord[c])) } return r }
+  function add(f, n, v) { if (n == "") return; body[f] = body[f] (body[f] == "" ? "" : "&") enc(n) "=" enc(v) }
+  BEGIN { for (i = 0; i < 256; i++) ord[sprintf("%c", i)] = i; nf = 0; f = 0 }
+  {
+    nt = split($0, parts, "<")
+    for (k = 2; k <= nt; k++) {
+      t = " " parts[k]; sub(/>.*/, "", t); tag = tolower(t); sub(/^ /, "", tag); sub(/[ \t].*/, "", tag); if (tag !~ /^\//) sub(/\/.*/, "", tag)
+      if (tag == "form") { nf++; f = nf; act[f] = attr(t, "action"); meth[f] = toupper(attr(t, "method")); if (meth[f] == "") meth[f] = "GET"; continue }
+      if (tag == "/form") { f = 0; continue }
+      if (tag == "option" && sel != "") { v = attr(t, "value"); if (!(sel in selv) || has(t, "selected")) selv[sel] = v; continue }
+      if (tag == "/select") { if (sel in selv) add(sf, sel, selv[sel]); sel = ""; continue }
+      if (f == 0 && tag != "a") continue
+      if (tag == "a") { h = attr(t, "href"); if (h ~ /[?&]username=T-/ || tolower(h) ~ /\/grant\?|accept|continue|agree|connect/) link = (link == "" ? h : link); continue }
+      if (tag == "select") { sel = attr(t, "name"); sf = f; continue }
+      if (tag == "textarea") { add(f, attr(t, "name"), ""); continue }
+      if (tag != "input" && tag != "button") continue
+      ty = tolower(attr(t, "type")); if (ty == "") ty = (tag == "button" ? "submit" : "text")
+      n = attr(t, "name"); v = attr(t, "value")
+      key = tolower(n " " attr(t, "id") " " attr(t, "placeholder") " " attr(t, "aria-label"))
+      req = has(t, "required")
+      if (ty == "hidden") { add(f, n, v); continue }
+      if (ty == "submit" || ty == "image") { if (!(f in sub_) && n != "") { sub_[f] = 1; add(f, n, v) } score[f] += 1; continue }
+      if (ty == "checkbox") { cbx[f]++; if (req || key ~ /term|agree|accept|tos|aup|condition|policy|consent|rule|disclaim/) { add(f, n, (v == "" ? "on" : v)); score[f] += 2 } else lone[f] = n "\t" v; continue }
+      if (ty == "radio") { if (!((f, n) in radio) || has(t, "checked")) radio[f, n] = v; continue }
+      if (ty == "button" || ty == "reset" || ty == "file") continue
+      if (key ~ /room|zimmer|chambre|habitaci|camera|kamer/) { fill = rm; score[f] += 3 }
+      else if (key ~ /surname|last.?name|lastname|family|nachname|apellido|nom de famille|cognome|achternaam/) { fill = sn; score[f] += 3 }
+      else if (key ~ /mail/) fill = em
+      else if (ty == "password" || key ~ /pass|voucher|code|pin|otp|token/) { fill = v; if (v == "") { pw[f] = n } }
+      else if (key ~ /(^| )(name|guest|gast)/) { fill = sn }
+      else fill = v
+      if (fill == "" && (req || ty == "password")) need[f] = need[f] (need[f] == "" ? "" : ",") n
+      add(f, n, fill)
+    }
+  }
+  END {
+    best = 0; bs = -99
+    for (i = 1; i <= nf; i++) {
+      for (r in radio) { split(r, rr, SUBSEP); if (rr[1] == i) add(i, rr[2], radio[r]) }
+      if (cbx[i] == 1 && lone[i] != "") { split(lone[i], lv, "\t"); add(i, lv[1], (lv[2] == "" ? "on" : lv[2])) }
+      s = score[i] - (i in need ? 10 : 0) - (tolower(act[i]) ~ /search|lang/ ? 5 : 0)
+      if (s > bs) { bs = s; best = i }
+    }
+    if (best && (best in need) && link != "") { print "LINK\t" link; exit }
+    if (best && (best in need)) { print "NEED\t" need[best]; exit }
+    if (best) { print meth[best] "\t" act[best]; print body[best]; exit }
+    if (link != "") { print "LINK\t" link; exit }
+  }'
+}
+
+# Known portal systems, recognised from the address bar
+vendor() {
+  urls="$(cat "$WORK/urls")"
+  g="$(for u in $urls; do qparam "$u" base_grant_url; done | head -n 1)"
+  if [ -n "$g" ]; then
+    c="$(for u in $urls; do qparam "$u" user_continue_url; done | head -n 1)"
+    log "Meraki portal, using its click-through grant"
+    fetch "$(urldecode "$g")?continue_url=${c:-http%3A%2F%2Fexample.com}&duration=86400"; return 0
+  fi
+  s="$(for u in $urls; do qparam "$u" switch_url; done | head -n 1)"
+  if [ -n "$s" ]; then
+    r="$(for u in $urls; do qparam "$u" redirect; done | head -n 1)"
+    log "Cisco WLC portal, sending its web-passthrough form"
+    fetch "$(urldecode "$s")" "buttonClicked=4&err_flag=0&err_msg=&info_flag=0&info_msg=&redirect_url=${r:-http%3A%2F%2Fexample.com}"; return 0
+  fi
+  case "$URL" in
+    http*://*:80[0-9][0-9]/index.html*)
+      if grep -qi captiveportal "$WORK/page"; then
+        p="$(urlport "$URL")"
+        log "OPNsense portal, logging on to zone $((p - 8000))"
+        fetch "$(origin "$URL")/api/captiveportal/access/logon/$((p - 8000))" "user=&password="; return 0
+      fi ;;
+  esac
+  return 1
+}
+
+capture() {
+  # one capture per access point until the router restarts
+  grep -qx "${bssid:-x}" /tmp/vpn-portal-captured 2>/dev/null && [ "$MODE" != capture ] && return
+  echo "${bssid:-x}" >> /tmp/vpn-portal-captured
+  # JavaScript portals keep their logic in script files: save those too
+  for js in $(tr '\n' ' ' < "$WORK/page" | grep -o '<script[^>]*src=["'"'"'][^"'"'"']*' | sed 's/.*src=["'"'"']//' | head -n 5); do
+    fetch "$(absurl "$URL" "$js")"
+  done
+  mkdir -p "$CAPDIR"
+  f="$CAPDIR/$(date +%Y%m%d-%H%M%S)-$(echo "${ssid:-unknown}" | tr -c 'A-Za-z0-9_-' _ | cut -c1-24).txt"
+  { echo "Portal capture for later automation"
+    echo "date: $(date)"; echo "ssid: $ssid"; echo "bssid: $bssid"; echo "uplink: $dev"
+    echo "result: $1"
+    echo "travelmate: $(jsonfilter -i /var/run/travelmate/travelmate.runtime.json -e '@.data.travelmate_status' 2>/dev/null)"
+    echo; echo "== addresses visited"; cat "$WORK/urls"
+    echo; echo "== cookies"; grep -v '^#' "$JAR" | sed 's/\t[^\t]*$/\t<value hidden>/'
+    cat "$WORK/trace"
+  } | head -c 400000 > "$f"
+  ls -1t "$CAPDIR"/*.txt 2>/dev/null | tail -n +$((KEEP + 1)) | while read -r old; do rm -f "$old"; done
+  log "saved portal capture $f"
+}
+
+# --- main -------------------------------------------------------------------
+
+fetch "$PROBE"
+if [ "$CODE" = 200 ] && [ "$(tr -d ' \r\n' < "$WORK/page")" = success ]; then
+  [ "$MODE" = capture ] && { log "no login page right now"; exit 0; }
+  exit 0
+fi
+
+if [ "$MODE" = capture ]; then capture "captured on request"; exit 0; fi
+
+log "login page found at $URL"
+round=0; why=""; tried=""
+while [ "$round" -lt 5 ]; do
+  round=$((round + 1))
+  if [ -z "$tried" ] && vendor; then tried=1
+  else
+    out="$(formfill)"
+    kind="$(echo "$out" | head -n 1 | cut -f1)"; target="$(echo "$out" | head -n 1 | cut -f2-)"
+    case "$kind" in
+      GET|POST)
+        body="$(echo "$out" | sed -n 2p)"
+        dest="$(absurl "$URL" "$target")"
+        log "submitting form to $dest"
+        if [ "$kind" = POST ]; then fetch "$dest" "$body"
+        else case "$dest" in *\?*) fetch "$dest&$body" ;; *) fetch "$dest?$body" ;; esac; fi ;;
+      LINK) dest="$(absurl "$URL" "$target")"; log "following $dest"; fetch "$dest" ;;
+      NEED) why="the page needs $target, which isn't set (surname/room/e-mail, or a password or voucher)"; break ;;
+      *)
+        r="$(softredirect)"
+        if [ -n "$r" ]; then fetch "$(absurl "$URL" "$r")"
+        else why="no form on the page (probably a JavaScript-only portal)"; break; fi ;;
+    esac
+  fi
+  if online; then log "logged in after $round step(s)"; exit 0; fi
+done
+
+capture "automatic login failed: ${why:-still offline after $round steps}"
+log "automatic login failed: ${why:-still offline}"
+exit 1

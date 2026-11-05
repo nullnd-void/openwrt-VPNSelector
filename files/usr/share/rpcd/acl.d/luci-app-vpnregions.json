@@ -1,0 +1,64 @@
+{
+	"luci-app-vpnregions": {
+		"description": "Grant access to VPN Regions",
+		"read": {
+			"file": {
+				"/tmp/vpn-failover": [
+					"read"
+				],
+				"/tmp/vpn-portal": [
+					"read"
+				],
+				"/var/run/travelmate/travelmate.runtime.json": [
+					"read"
+				],
+				"/usr/bin/wg show all latest-handshakes": [
+					"exec"
+				],
+				"/root/portal-captures": [
+					"list"
+				],
+				"/root/portal-captures/*": [
+					"read"
+				]
+			},
+			"uci": [
+				"vpnregions",
+				"network",
+				"firewall",
+				"travelmate"
+			]
+		},
+		"write": {
+			"file": {
+				"/usr/bin/vpn-failover.sh": [
+					"exec"
+				],
+				"/usr/bin/vpn-failover.sh next": [
+					"exec"
+				],
+				"/usr/bin/vpn-failover.sh portal 5": [
+					"exec"
+				],
+				"/usr/bin/vpn-failover.sh portal close": [
+					"exec"
+				],
+				"/usr/bin/vpn-portal-login": [
+					"exec"
+				],
+				"/usr/bin/vpn-portal-login capture": [
+					"exec"
+				],
+				"/root/portal-captures/*": [
+					"write"
+				]
+			},
+			"uci": [
+				"vpnregions",
+				"network",
+				"firewall",
+				"travelmate"
+			]
+		}
+	}
+}

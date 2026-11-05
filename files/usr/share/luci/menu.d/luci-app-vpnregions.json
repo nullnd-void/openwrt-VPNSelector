@@ -1,0 +1,14 @@
+{
+	"admin/services/vpnregions": {
+		"title": "VPN Regions",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "vpnregions"
+		},
+		"depends": {
+			"acl": [ "luci-app-vpnregions" ],
+			"uci": { "vpnregions": true }
+		}
+	}
+}
