@@ -107,3 +107,9 @@ This removes the page, the scripts, the cron job and the dnsmasq setting. It lea
 - `installer/head.sh` and `installer/tail.sh` are the installer steps before and after the files are written.
 - `tools/build-installer.sh` rebuilds `install.sh` from those. Run it after changing anything in `files/` or `installer/`, and commit both.
 - `test/mock-portals.py` runs fake captive portals on 127.0.0.1 for testing `vpn-portal-login`.
+
+## License
+
+Apache License 2.0, see [LICENSE](LICENSE). This is the license LuCI and its `luci-app-*` packages use. So the page and scripts can go into the OpenWrt LuCI feed, or be combined with OpenWrt's own GPL-2.0 code, without relicensing.
+
+Copyright 2026 nullnd-void.
