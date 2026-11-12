@@ -45,7 +45,7 @@ fi
 # taken from the name (VPN_Canada -> Canada). The uplink is travelmate's wwan
 # if there is one, otherwise wan.
 if [ ! -s /etc/config/vpnregions ]; then
-  old=$(sed -n 's/^VPNS="\([^"]*\)".*/\1/p' /usr/bin/vpn-failover.sh 2>/dev/null)
+  old=$(sed -n 's/^VPNS="\([^"]*\)".*/\1/p' /usr/bin/vpn-failover.sh 2>/dev/null) || true
   wg=$(uci show network | sed -n "s/^network\.\([^.]*\)\.proto='wireguard'$/\1/p")
   uplink=wan; [ -n "$(uci -q get network.wwan)" ] && uplink=wwan
   touch /etc/config/vpnregions

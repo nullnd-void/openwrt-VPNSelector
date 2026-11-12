@@ -26,7 +26,7 @@ fi
 
 # DNS: dnsmasq takes its upstream servers from a file that vpn-failover.sh
 # keeps pointed at the active tunnel's DNS, so lookups don't leak to the hotel
-grep -v '^#' /tmp/resolv.conf.d/resolv.conf.auto > /tmp/resolv.conf.vpnregions 2>/dev/null
+grep -v '^#' /tmp/resolv.conf.d/resolv.conf.auto > /tmp/resolv.conf.vpnregions 2>/dev/null || true
 if [ "$(uci -q get dhcp.@dnsmasq[0].resolvfile)" != /tmp/resolv.conf.vpnregions ]; then
   uci set dhcp.@dnsmasq[0].resolvfile='/tmp/resolv.conf.vpnregions'
   uci commit dhcp

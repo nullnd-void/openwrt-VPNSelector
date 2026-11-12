@@ -227,7 +227,7 @@ return view.extend({
 
 						ui.hideModal();
 						if (problems.length)
-							ui.addNotification(_('Some configs were skipped'), E('ul', problems.map(p => E('li', p))), 'warning');
+							ui.addNotification(_('Some configs were skipped'), E('ul', problems.map(p => E('li', [ p ]))), 'warning');
 						if (!added.length)
 							return;
 
@@ -271,7 +271,7 @@ return view.extend({
 					: _('No tunnel up (no uplink internet yet, a login page waiting, or no tunnel in this region).')).outerHTML;
 			const hs = handshakes[active];
 			return E('span', [
-				E('strong', active), ' ',
+				E('strong', [ active ]), ' ',
 				_('since %s').format(new Date(+stateLine[1] * 1000).toLocaleTimeString()), ', ',
 				hs ? _('last handshake %s').format(ago(Math.max(0, now - hs))) : _('no handshake yet')
 			]).outerHTML;
@@ -433,7 +433,7 @@ return view.extend({
 		o.rmempty = false;
 		o.textvalue = function(section_id) {
 			const v = this.cfgvalue(section_id);
-			return v == active ? E('strong', [ v, ' ●' ]) : v;
+			return v == active ? E('strong', [ v, ' ●' ]) : '%h'.format(v);
 		};
 
 		o = s.option(form.DummyValue, '_server', _('Server'));
@@ -441,7 +441,7 @@ return view.extend({
 		o.textvalue = function(section_id) {
 			const p = peersOf(uci.get('vpnregions', section_id, 'iface'))[0];
 			if (!p) return E('em', _('no enabled peer'));
-			return '%s (%s:%s)'.format(p.description || '-', p.endpoint_host || '?', p.endpoint_port || '51820');
+			return '%h (%h:%h)'.format(p.description || '-', p.endpoint_host || '?', p.endpoint_port || '51820');
 		};
 
 		o = s.option(form.Value, 'region', _('Region'));

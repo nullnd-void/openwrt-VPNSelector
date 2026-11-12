@@ -45,7 +45,7 @@ fi
 # taken from the name (VPN_Canada -> Canada). The uplink is travelmate's wwan
 # if there is one, otherwise wan.
 if [ ! -s /etc/config/vpnregions ]; then
-  old=$(sed -n 's/^VPNS="\([^"]*\)".*/\1/p' /usr/bin/vpn-failover.sh 2>/dev/null)
+  old=$(sed -n 's/^VPNS="\([^"]*\)".*/\1/p' /usr/bin/vpn-failover.sh 2>/dev/null) || true
   wg=$(uci show network | sed -n "s/^network\.\([^.]*\)\.proto='wireguard'$/\1/p")
   uplink=wan; [ -n "$(uci -q get network.wwan)" ] && uplink=wwan
   touch /etc/config/vpnregions
@@ -203,13 +203,25 @@ portal_rules() {
   nft -a list chain inet fw4 forward_lan 2>/dev/null |
     sed -n 's/.*comment "vpn-portal".*# handle \([0-9]*\)$/\1/p'
 }
+# The rule carries its own end time ($2) where the kernel supports it, so the
+# kill switch comes back even if cron never runs this script again.
 portal_open_rule() {
   [ -n "$1" ] && [ -z "$(portal_rules)" ] || return 0
-  nft insert rule inet fw4 forward_lan oifname "\"$1\"" counter accept comment '"vpn-portal"'
+  nft insert rule inet fw4 forward_lan oifname "\"$1\"" meta time \< "${2:-0}" counter accept comment '"vpn-portal"' 2>/dev/null ||
+    nft insert rule inet fw4 forward_lan oifname "\"$1\"" counter accept comment '"vpn-portal"'
 }
-portal_close() {
+portal_drop_rules() {
   for h in $(portal_rules); do nft delete rule inet fw4 forward_lan handle "$h"; done
-  [ -f "$PORTAL" ] && log "hotel login window closed"
+}
+# Closing also forgets every tracked connection: the firewall keeps passing
+# connections it has already accepted, so anything a LAN device opened over
+# the plain uplink during the window would otherwise carry on after it.
+portal_close() {
+  portal_drop_rules
+  if [ -f "$PORTAL" ]; then
+    conntrack -F >/dev/null 2>&1 || { echo f > /proc/net/nf_conntrack; } 2>/dev/null
+    log "hotel login window closed"
+  fi
   rm -f "$PORTAL"
 }
 
@@ -246,10 +258,12 @@ case "$1" in
     else
       min=${2:-$PORTALMIN}
       case "$min" in ''|*[!0-9]*) min=5 ;; esac
-      echo $((now + min * 60)) > "$PORTAL"
+      ends=$((now + min * 60))
+      echo "$ends" > "$PORTAL"
       log "hotel login window open for $min min"
       all_down
-      portal_open_rule "$dev"
+      portal_drop_rules   # a rule from an earlier window has the old end time
+      portal_open_rule "$dev" "$ends"
     fi
     exit 0
     ;;
@@ -261,13 +275,20 @@ if [ -f "$PORTAL" ]; then
   read ends < "$PORTAL"
   if [ "$now" -lt "${ends:-0}" ]; then
     all_down
-    portal_open_rule "$dev"
+    portal_open_rule "$dev" "$ends"
     exit 0
   fi
   portal_close
 fi
 
-[ "$ENABLED" = 1 ] || { set_dns; exit 0; }
+# Failover off: leave the tunnels alone, but keep DNS on a tunnel that the
+# user started by hand.
+if [ "$ENABLED" != 1 ]; then
+  up=""
+  for v in $ALL; do is_up "$v" && { up=$v; break; }; done
+  set_dns "$up"
+  exit 0
+fi
 
 # 1. The uplink must reach the internet on its own first. Until it does
 #    (no Wi-Fi yet, or a captive portal still waiting for a login) keep
@@ -352,6 +373,15 @@ log "starting $next (region '$REGION')"
 set_dns
 ifup "$next"
 echo "$next $now" > "$STATE"
+# Move DNS to the tunnel as soon as it has a handshake, instead of leaving
+# lookups on the uplink's DNS until the next run a minute later.
+i=0
+while [ "$i" -lt 15 ]; do
+  sleep 1; i=$((i + 1))
+  hs=$(wg show "$next" latest-handshakes 2>/dev/null | awk '$2>m{m=$2} END{print m+0}')
+  [ "$hs" -gt 0 ] && is_up "$next" && { set_dns "$next"; break; }
+done
+exit 0
 VPNREGIONS_EOF
 
 cat > /usr/bin/vpn-portal-login <<'VPNREGIONS_EOF'
@@ -444,8 +474,11 @@ qparam() { echo "$1" | sed -n "s/.*[?&]$2=\([^&#]*\).*/\1/p"; }
 fetch() {
   url="$1"; data="$2"; n=0
   while :; do
+    # the address comes from the portal: web addresses only, never file:// or
+    # something curl would read as an option
+    case "$url" in http://*|https://*) ;; *) URL="$url"; CODE=000; : > "$WORK/page"; return 0 ;; esac
     n=$((n + 1)); host="$(urlhost "$url")"; port="$(urlport "$url")"; ip="$(resolve "$host")"
-    set -- -sk -m 15 --interface "$dev" -A "$UA" -b "$JAR" -c "$JAR" -D "$WORK/hdr" -o "$WORK/page"
+    set -- -sk -m 15 --proto =http,https --interface "$dev" -A "$UA" -b "$JAR" -c "$JAR" -D "$WORK/hdr" -o "$WORK/page"
     [ -n "$ip" ] && [ "$ip" != "$host" ] && set -- "$@" --resolve "$host:$port:$ip"
     [ -n "$data" ] && set -- "$@" --data "$data" -H "Content-Type: application/x-www-form-urlencoded"
     code="$(curl "$@" -w '%{http_code}' "$url" 2>/dev/null)"
@@ -566,6 +599,20 @@ vendor() {
   return 1
 }
 
+# Captures are meant to be passed on, so take out the surname, room and
+# e-mail that were typed into forms (plain and URL-encoded) and cookie values.
+scrub() {
+  awk -v a="$SURNAME" -v b="$ROOM" -v c="$EMAIL" -v ae="$(urlencode "$SURNAME")" -v be="$(urlencode "$ROOM")" -v ce="$(urlencode "$EMAIL")" '
+    function rep(s, f, t,   r, i) { if (f == "") return s; r = ""; while ((i = index(s, f))) { r = r substr(s, 1, i - 1) t; s = substr(s, i + length(f)) } return r s }
+    { l = $0
+      if (tolower(l) ~ /^(set-)?cookie:/) { sub(/:.*/, ": <hidden>", l); print l; next }
+      l = rep(l, c, "<e-mail>"); l = rep(l, ce, "<e-mail>")
+      l = rep(l, a, "<surname>"); l = rep(l, ae, "<surname>")
+      if (l ~ /^-- data: / || l ~ /^== (GET|POST) /) { l = rep(l, "=" b "&", "=<room>&"); l = rep(l, "=" be "&", "=<room>&")
+        if (b != "" && substr(l, length(l) - length(b)) == "=" b) l = substr(l, 1, length(l) - length(b)) "<room>" }
+      print l }'
+}
+
 capture() {
   # one capture per access point until the router restarts
   grep -qx "${bssid:-x}" /tmp/vpn-portal-captured 2>/dev/null && [ "$MODE" != capture ] && return
@@ -583,7 +630,7 @@ capture() {
     echo; echo "== addresses visited"; cat "$WORK/urls"
     echo; echo "== cookies"; grep -v '^#' "$JAR" | sed 's/\t[^\t]*$/\t<value hidden>/'
     cat "$WORK/trace"
-  } | head -c 400000 > "$f"
+  } | scrub | head -c 400000 > "$f"
   ls -1t "$CAPDIR"/*.txt 2>/dev/null | tail -n +$((KEEP + 1)) | while read -r old; do rm -f "$old"; done
   log "saved portal capture $f"
 }
@@ -859,7 +906,7 @@ return view.extend({
 
 						ui.hideModal();
 						if (problems.length)
-							ui.addNotification(_('Some configs were skipped'), E('ul', problems.map(p => E('li', p))), 'warning');
+							ui.addNotification(_('Some configs were skipped'), E('ul', problems.map(p => E('li', [ p ]))), 'warning');
 						if (!added.length)
 							return;
 
@@ -903,7 +950,7 @@ return view.extend({
 					: _('No tunnel up (no uplink internet yet, a login page waiting, or no tunnel in this region).')).outerHTML;
 			const hs = handshakes[active];
 			return E('span', [
-				E('strong', active), ' ',
+				E('strong', [ active ]), ' ',
 				_('since %s').format(new Date(+stateLine[1] * 1000).toLocaleTimeString()), ', ',
 				hs ? _('last handshake %s').format(ago(Math.max(0, now - hs))) : _('no handshake yet')
 			]).outerHTML;
@@ -1065,7 +1112,7 @@ return view.extend({
 		o.rmempty = false;
 		o.textvalue = function(section_id) {
 			const v = this.cfgvalue(section_id);
-			return v == active ? E('strong', [ v, ' ●' ]) : v;
+			return v == active ? E('strong', [ v, ' ●' ]) : '%h'.format(v);
 		};
 
 		o = s.option(form.DummyValue, '_server', _('Server'));
@@ -1073,7 +1120,7 @@ return view.extend({
 		o.textvalue = function(section_id) {
 			const p = peersOf(uci.get('vpnregions', section_id, 'iface'))[0];
 			if (!p) return E('em', _('no enabled peer'));
-			return '%s (%s:%s)'.format(p.description || '-', p.endpoint_host || '?', p.endpoint_port || '51820');
+			return '%h (%h:%h)'.format(p.description || '-', p.endpoint_host || '?', p.endpoint_port || '51820');
 		};
 
 		o = s.option(form.Value, 'region', _('Region'));
@@ -1210,7 +1257,7 @@ fi
 
 # DNS: dnsmasq takes its upstream servers from a file that vpn-failover.sh
 # keeps pointed at the active tunnel's DNS, so lookups don't leak to the hotel
-grep -v '^#' /tmp/resolv.conf.d/resolv.conf.auto > /tmp/resolv.conf.vpnregions 2>/dev/null
+grep -v '^#' /tmp/resolv.conf.d/resolv.conf.auto > /tmp/resolv.conf.vpnregions 2>/dev/null || true
 if [ "$(uci -q get dhcp.@dnsmasq[0].resolvfile)" != /tmp/resolv.conf.vpnregions ]; then
   uci set dhcp.@dnsmasq[0].resolvfile='/tmp/resolv.conf.vpnregions'
   uci commit dhcp
