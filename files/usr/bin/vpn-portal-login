@@ -87,8 +87,11 @@ qparam() { echo "$1" | sed -n "s/.*[?&]$2=\([^&#]*\).*/\1/p"; }
 fetch() {
   url="$1"; data="$2"; n=0
   while :; do
+    # the address comes from the portal: web addresses only, never file:// or
+    # something curl would read as an option
+    case "$url" in http://*|https://*) ;; *) URL="$url"; CODE=000; : > "$WORK/page"; return 0 ;; esac
     n=$((n + 1)); host="$(urlhost "$url")"; port="$(urlport "$url")"; ip="$(resolve "$host")"
-    set -- -sk -m 15 --interface "$dev" -A "$UA" -b "$JAR" -c "$JAR" -D "$WORK/hdr" -o "$WORK/page"
+    set -- -sk -m 15 --proto =http,https --interface "$dev" -A "$UA" -b "$JAR" -c "$JAR" -D "$WORK/hdr" -o "$WORK/page"
     [ -n "$ip" ] && [ "$ip" != "$host" ] && set -- "$@" --resolve "$host:$port:$ip"
     [ -n "$data" ] && set -- "$@" --data "$data" -H "Content-Type: application/x-www-form-urlencoded"
     code="$(curl "$@" -w '%{http_code}' "$url" 2>/dev/null)"
@@ -209,6 +212,20 @@ vendor() {
   return 1
 }
 
+# Captures are meant to be passed on, so take out the surname, room and
+# e-mail that were typed into forms (plain and URL-encoded) and cookie values.
+scrub() {
+  awk -v a="$SURNAME" -v b="$ROOM" -v c="$EMAIL" -v ae="$(urlencode "$SURNAME")" -v be="$(urlencode "$ROOM")" -v ce="$(urlencode "$EMAIL")" '
+    function rep(s, f, t,   r, i) { if (f == "") return s; r = ""; while ((i = index(s, f))) { r = r substr(s, 1, i - 1) t; s = substr(s, i + length(f)) } return r s }
+    { l = $0
+      if (tolower(l) ~ /^(set-)?cookie:/) { sub(/:.*/, ": <hidden>", l); print l; next }
+      l = rep(l, c, "<e-mail>"); l = rep(l, ce, "<e-mail>")
+      l = rep(l, a, "<surname>"); l = rep(l, ae, "<surname>")
+      if (l ~ /^-- data: / || l ~ /^== (GET|POST) /) { l = rep(l, "=" b "&", "=<room>&"); l = rep(l, "=" be "&", "=<room>&")
+        if (b != "" && substr(l, length(l) - length(b)) == "=" b) l = substr(l, 1, length(l) - length(b)) "<room>" }
+      print l }'
+}
+
 capture() {
   # one capture per access point until the router restarts
   grep -qx "${bssid:-x}" /tmp/vpn-portal-captured 2>/dev/null && [ "$MODE" != capture ] && return
@@ -226,7 +243,7 @@ capture() {
     echo; echo "== addresses visited"; cat "$WORK/urls"
     echo; echo "== cookies"; grep -v '^#' "$JAR" | sed 's/\t[^\t]*$/\t<value hidden>/'
     cat "$WORK/trace"
-  } | head -c 400000 > "$f"
+  } | scrub | head -c 400000 > "$f"
   ls -1t "$CAPDIR"/*.txt 2>/dev/null | tail -n +$((KEEP + 1)) | while read -r old; do rm -f "$old"; done
   log "saved portal capture $f"
 }

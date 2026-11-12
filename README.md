@@ -20,8 +20,8 @@ Tested on a Cudy TR3000 with OpenWrt 25.12 (apk), travelmate 2.4.9 and Proton VP
   - It recognises Meraki, Cisco WLC, OPNsense and MikroTik trial logins.
   - For other pages it fills in the form: it ticks the terms box and enters the surname, room number and e-mail you set on the page.
   - It retries at most every 5 minutes per access point.
-- **Saved login pages.** A login page the router can't get through is saved to `/root/portal-captures`, with cookie values hidden. One page is kept per access point, up to the newest 10. You can download them from the page so a login for that hotel can be added later. See [docs/portal-research.md](docs/portal-research.md).
-- **Manual login** opens the plain uplink for 5 minutes, with the VPN down, so a phone or laptop can sign in to a portal. It closes by itself, then the VPN comes back.
+- **Saved login pages.** A login page the router can't get through is saved to `/root/portal-captures`, with cookie values and the surname, room number and e-mail you entered taken out. One page is kept per access point, up to the newest 10. You can download them from the page so a login for that hotel can be added later. See [docs/portal-research.md](docs/portal-research.md).
+- **Manual login** opens the plain uplink for 5 minutes, with the VPN down, so a phone or laptop can sign in to a portal. It closes by itself, then the VPN comes back. Connections opened during the window are cut when it closes.
 - **No DNS leaks.** While a tunnel is up, dnsmasq only asks that tunnel's DNS servers. The uplink's DNS is used only while no tunnel is up, for example during a hotel login.
 
 ## Install

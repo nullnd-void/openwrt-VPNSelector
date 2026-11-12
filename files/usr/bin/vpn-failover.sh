@@ -88,13 +88,25 @@ portal_rules() {
   nft -a list chain inet fw4 forward_lan 2>/dev/null |
     sed -n 's/.*comment "vpn-portal".*# handle \([0-9]*\)$/\1/p'
 }
+# The rule carries its own end time ($2) where the kernel supports it, so the
+# kill switch comes back even if cron never runs this script again.
 portal_open_rule() {
   [ -n "$1" ] && [ -z "$(portal_rules)" ] || return 0
-  nft insert rule inet fw4 forward_lan oifname "\"$1\"" counter accept comment '"vpn-portal"'
+  nft insert rule inet fw4 forward_lan oifname "\"$1\"" meta time \< "${2:-0}" counter accept comment '"vpn-portal"' 2>/dev/null ||
+    nft insert rule inet fw4 forward_lan oifname "\"$1\"" counter accept comment '"vpn-portal"'
 }
-portal_close() {
+portal_drop_rules() {
   for h in $(portal_rules); do nft delete rule inet fw4 forward_lan handle "$h"; done
-  [ -f "$PORTAL" ] && log "hotel login window closed"
+}
+# Closing also forgets every tracked connection: the firewall keeps passing
+# connections it has already accepted, so anything a LAN device opened over
+# the plain uplink during the window would otherwise carry on after it.
+portal_close() {
+  portal_drop_rules
+  if [ -f "$PORTAL" ]; then
+    conntrack -F >/dev/null 2>&1 || { echo f > /proc/net/nf_conntrack; } 2>/dev/null
+    log "hotel login window closed"
+  fi
   rm -f "$PORTAL"
 }
 
@@ -131,10 +143,12 @@ case "$1" in
     else
       min=${2:-$PORTALMIN}
       case "$min" in ''|*[!0-9]*) min=5 ;; esac
-      echo $((now + min * 60)) > "$PORTAL"
+      ends=$((now + min * 60))
+      echo "$ends" > "$PORTAL"
       log "hotel login window open for $min min"
       all_down
-      portal_open_rule "$dev"
+      portal_drop_rules   # a rule from an earlier window has the old end time
+      portal_open_rule "$dev" "$ends"
     fi
     exit 0
     ;;
@@ -146,13 +160,20 @@ if [ -f "$PORTAL" ]; then
   read ends < "$PORTAL"
   if [ "$now" -lt "${ends:-0}" ]; then
     all_down
-    portal_open_rule "$dev"
+    portal_open_rule "$dev" "$ends"
     exit 0
   fi
   portal_close
 fi
 
-[ "$ENABLED" = 1 ] || { set_dns; exit 0; }
+# Failover off: leave the tunnels alone, but keep DNS on a tunnel that the
+# user started by hand.
+if [ "$ENABLED" != 1 ]; then
+  up=""
+  for v in $ALL; do is_up "$v" && { up=$v; break; }; done
+  set_dns "$up"
+  exit 0
+fi
 
 # 1. The uplink must reach the internet on its own first. Until it does
 #    (no Wi-Fi yet, or a captive portal still waiting for a login) keep
@@ -237,3 +258,12 @@ log "starting $next (region '$REGION')"
 set_dns
 ifup "$next"
 echo "$next $now" > "$STATE"
+# Move DNS to the tunnel as soon as it has a handshake, instead of leaving
+# lookups on the uplink's DNS until the next run a minute later.
+i=0
+while [ "$i" -lt 15 ]; do
+  sleep 1; i=$((i + 1))
+  hs=$(wg show "$next" latest-handshakes 2>/dev/null | awk '$2>m{m=$2} END{print m+0}')
+  [ "$hs" -gt 0 ] && is_up "$next" && { set_dns "$next"; break; }
+done
+exit 0
