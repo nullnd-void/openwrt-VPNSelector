@@ -249,6 +249,14 @@ portal_autologin() {
 }
 
 now=$(date +%s)
+# Behind a login page the router can't set its clock, so it jumps forward
+# (often by days) once the login lets NTP through. WireGuard's handshake
+# times and our own timestamps are then wrong for a moment: don't switch
+# tunnels on them, just restart the grace period.
+last=0; [ -f "$STATE.last" ] && read last < "$STATE.last"
+echo "$now" > "$STATE.last"
+jumped=""
+[ "$last" -gt 0 ] && { [ $((now - last)) -gt 600 ] || [ "$now" -lt "$last" ]; } && jumped=1
 dev="$(ifstatus "$UPLINK" 2>/dev/null | jsonfilter -e '@.l3_device')"
 
 case "$1" in
@@ -352,6 +360,10 @@ if [ -n "$cur" ]; then
     log "switching from $cur on request"
   else
     healthy "$cur" && { set_dns "$cur"; exit 0; }
+    if [ -n "$jumped" ]; then
+      log "the clock jumped, giving $cur a fresh grace period"
+      echo "$cur $((now + 120))" > "$STATE"; exit 0   # WireGuard re-handshakes within 2 min
+    fi
     [ $((now - since)) -lt "$GRACE" ] && exit 0
     log "$cur is not passing traffic, switching"
   fi
