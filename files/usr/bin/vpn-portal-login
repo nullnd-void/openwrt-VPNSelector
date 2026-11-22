@@ -6,7 +6,7 @@
 #   vpn-portal-login capture    only save the portal's pages for later
 #
 # It knows a few portal systems (Meraki, Cisco WLC, OPNsense, MikroTik trial,
-# and recognises ElevenOS without logging in to it yet)
+# ElevenOS free plans)
 # and otherwise fills in the page's form: ticks the terms box, keeps hidden
 # fields, and enters surname, room and e-mail from /etc/config/vpnregions.
 # A portal it can't get through is saved under /root/portal-captures, so a
@@ -90,11 +90,11 @@ urldecode() {
 urlencode() { printf '%s' "$1" | awk 'BEGIN{for(i=0;i<256;i++)o[sprintf("%c",i)]=i} {s=(NR>1?"%0A":""); for(i=1;i<=length($0);i++){c=substr($0,i,1); s=s (c~/[A-Za-z0-9._~-]/?c:sprintf("%%%02X",o[c]))} printf "%s",s}'; }
 qparam() { echo "$1" | sed -n "s/.*[?&]$2=\([^&#]*\).*/\1/p"; }
 
-# fetch URL [POSTDATA]: follow redirects by hand (each host resolved through
+# fetch URL [POSTDATA [CONTENT-TYPE]]: follow redirects by hand (each host resolved through
 # the uplink's DNS), log everything for a capture, leave the final page in
 # $WORK/page and its address in $URL.
 fetch() {
-  url="$1"; data="$2"; n=0
+  url="$1"; data="$2"; ctype="${3:-application/x-www-form-urlencoded}"; n=0
   while :; do
     # the address comes from the portal: web addresses only, never file:// or
     # something curl would read as an option
@@ -102,7 +102,7 @@ fetch() {
     n=$((n + 1)); host="$(urlhost "$url")"; port="$(urlport "$url")"; ip="$(resolve "$host")"
     set -- -sk -m 15 --proto =http,https --interface "$dev" -A "$UA" -b "$JAR" -c "$JAR" -D "$WORK/hdr" -o "$WORK/page"
     [ -n "$ip" ] && [ "$ip" != "$host" ] && set -- "$@" --resolve "$host:$port:$ip"
-    [ -n "$data" ] && set -- "$@" --data "$data" -H "Content-Type: application/x-www-form-urlencoded"
+    [ -n "$data" ] && set -- "$@" --data "$data" -H "Content-Type: $ctype"
     code="$(curl "$@" -w '%{http_code}' "$url" 2>/dev/null)"
     { echo; echo "== $([ -n "$data" ] && echo POST || echo GET) $url -> $code"; [ -n "$data" ] && echo "-- data: $data"
       cat "$WORK/hdr" 2>/dev/null; head -c 60000 "$WORK/page" 2>/dev/null; echo; } >> "$WORK/trace"
@@ -232,6 +232,30 @@ elevenos() {
   return 0
 }
 
+# ElevenOS free plans (name and e-mail form, "Connect"): ask the portal's
+# server to create a user on the free plan and log this device in, the way
+# the app's Connect button does.
+EOS_KEY="KRELFQQIWWCJ0WZBFFOKHFGXUT1EPVEE"   # the app's public API key (in its script)
+jstr() { printf '%s' "$1" | sed 's/[\\"]/\\&/g'; }
+eos_login() {
+  [ -n "$EOS_ORG" ] || return 1
+  page="$URL"; o="$(origin "$URL")"
+  qp() { v="$(qparam "$page" "$1")"; [ -n "$v" ] || v="$(qparam "$page" "$(echo "$1" | tr A-Z a-z)")"; urldecode "$v"; }
+  ui="$(qp UI)"; ma="$(qp MA | tr -d ':-')"; sip="$(qp SIP)"; [ -n "$sip" ] || sip="$(qp IP)"; rn="$(qp RN)"
+  [ -n "$rn" ] && ui="$ui:$rn"
+  fetch "$o/ElevenOS/WebApi/portal/plan/$EOS_ORG"
+  # first plan that costs nothing and has the FREE method
+  plan="$(awk '{ gsub(/\{"Id":/, "\n{\"Id\":"); print }' "$WORK/page" | grep '"Code":"FREE"' | grep -E '"Price":0(\.0*)?[,}]' | sed -n 's/^{"Id":[^,]*,"Code":"\([^"]*\)".*/\1/p' | head -n 1)"
+  if [ -z "$plan" ]; then why="ElevenOS portal (organisation $EOS_ORG) has no free plan: it needs a room number, access code or payment"; return 1; fi
+  if [ -z "$EMAIL" ]; then why="ElevenOS portal needs an e-mail address: set it under Hotel Wi-Fi login"; return 1; fi
+  ua="$(printf '%s' "$UA" | sed 's#/#%2F#g; s/ /+/g')"
+  body="{\"url\":\"https://secure.11os.com/Guest/Portal/CreateUserViaFree5JSONP\",\"data\":{\"UserMac\":\"$(jstr "$ma")\",\"UserIpOpt\":\"$(jstr "$sip")\",\"GatewayId\":\"$(jstr "$ui")\",\"LoginUrl\":\"\",\"PortalSessionId\":\"\",\"CalledStationId\":\"\",\"AuditSessionId\":\"\",\"AcctSessionId\":\"\",\"NasDeviceIp\":\"\",\"UserInfo\":\"$(jstr "$ua")\",\"LoginUser\":true,\"PasswordOpt\":\"\",\"PromoCodeOpt\":\"\",\"UserNameOpt\":\"\",\"Email\":\"\",\"MarketingContact\":\"$(jstr "$EMAIL,Guest,${SURNAME:-Guest}")\",\"MarketingOptIn\":false,\"ServicePlanCode\":\"$(jstr "$plan")\",\"ServiceQuantity\":\"1\",\"EwsKey\":\"$EOS_KEY\",\"callback\":\"proxy\"}}"
+  log "ElevenOS portal (organisation $EOS_ORG), free plan $plan"
+  fetch "$o/proxy" "$body" "application/json"
+  sleep 3   # the server tells the gateway; give it a moment
+  return 0
+}
+
 # Captures are meant to be passed on, so take out the surname, room and
 # e-mail that were typed into forms (plain and URL-encoded) and cookie values.
 scrub() {
@@ -300,7 +324,7 @@ if [ "$MODE" = capture ]; then
 fi
 
 log "login page found at $URL"
-round=0; why=""; tried=""
+round=0; why=""; tried=""; eos_tried=""
 while [ "$round" -lt 5 ]; do
   round=$((round + 1))
   if [ -z "$tried" ] && vendor; then tried=1
@@ -318,7 +342,12 @@ while [ "$round" -lt 5 ]; do
       NEED) why="the page needs $target, which isn't set (surname/room/e-mail, or a password or voucher)"; break ;;
       *)
         if elevenos; then
-          why="ElevenOS portal (organisation ${EOS_ORG:-unknown}), a JavaScript app this script can't log in to yet"; break
+          if [ -z "$eos_tried" ]; then eos_tried=1; why=""
+            eos_login || break
+            for t in 1 2 3; do online && { log "logged in after $round step(s)"; exit 0; }; sleep 5; done
+            why="ElevenOS login sent, but the uplink is still offline"
+          fi
+          break
         fi
         r="$(softredirect)"
         if [ -n "$r" ]; then fetch "$(absurl "$URL" "$r")"

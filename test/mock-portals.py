@@ -50,8 +50,13 @@ def elevenos(s,m,p,st):
     # MikroTik gateway -> secure.11os.com/roaming -> JavaScript app (placeholder values only)
     if p=='/start': return s.send(302,'',{'Location':s.base()+'/login'})
     if p=='/login': return s.send(200,'<form name="redirect" action="%s/roaming/mikrotikgateway/" method="get"><input type="hidden" name="UI" value="UF-000-00_00-00-00-00-00-00_0"><input type="hidden" name="MA" value="02:00:00:00:00:01"><input type="hidden" name="SIP" value="10.0.0.2"><input type="hidden" name="OS" value=\'\'><input type="hidden" name="RN" value=""><input type="submit" value="continue"></form><script>document.redirect.submit();</script>'%s.base())
-    if p=='/roaming/mikrotikgateway/': return s.send(302,'',{'Location':s.base()+'/portal-system/portal/?ORG=1234&ui=%s&ma=%s'%(s.q().get('UI',[''])[0],s.q().get('MA',[''])[0])})
+    if p=='/roaming/mikrotikgateway/': return s.send(302,'',{'Location':s.base()+'/portal-system/portal/?MA=%s&OS=&RN=&SIP=%s&UI=%s&ORG=1234'%(up.quote(s.q().get('MA',[''])[0]),s.q().get('SIP',[''])[0],s.q().get('UI',[''])[0])})
     if p=='/portal-system/portal/': return s.send(200,'<html><head><script type="module" src="/portal-system/portal/assets/index-x.js"></script></head><body><div id="root"></div></body></html>')
+    if p=='/ElevenOS/WebApi/portal/plan/1234': return s.send(200,'[{"Id":1,"Code":"PAID-1","Price":5.0000,"Methods":[{"Code":"CC","Name":"Card"}]},{"Id":2,"Code":"FREE-PLAN","Name":"Email","Price":0.0000,"Methods":[{"Code":"FREE","Name":"Free"}]}]')
+    if p=='/proxy' and m=='POST':
+        import json; n=int(s.headers.get('Content-Length') or 0); j=json.loads(s.rfile.read(n)); d=j['data']; st['got']=j
+        st['ok']= j['url'].endswith('/Guest/Portal/CreateUserViaFree5JSONP') and d['ServicePlanCode']=='FREE-PLAN' and d['UserMac']=='020000000001' and d['GatewayId'].startswith('UF-000') and d['LoginUser'] is True and '@' in d['MarketingContact']
+        return s.send(200,'proxy({"Success":true})')
     if p.startswith('/ElevenOS/WebApi/portal/'): return s.send(200,'{"LandingPageUrl":"http://example.com","path":"%s"}'%p)
     s.send(404,'')
 def opn(s,m,p,st):
