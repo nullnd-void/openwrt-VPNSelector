@@ -46,12 +46,20 @@ def mikrotik(s,m,p,st):
     if p=='/start': return s.send(302,'',{'Location':'/login?dst=http%3A%2F%2Fexample.com'})
     if p=='/login' and 'username' in s.q(): st['ok']=s.q()['username'][0].startswith('T-'); return s.send(200,'You are logged in')
     if p=='/login': return s.send(200,'<form name=login action="/login" method=post><input name=username><input type=password name=password></form><a href="/login?dst=http%3A%2F%2Fexample.com&amp;username=T-AA%3ABB">Free trial</a>')
+def elevenos(s,m,p,st):
+    # MikroTik gateway -> secure.11os.com/roaming -> JavaScript app (placeholder values only)
+    if p=='/start': return s.send(302,'',{'Location':s.base()+'/login'})
+    if p=='/login': return s.send(200,'<form name="redirect" action="%s/roaming/mikrotikgateway/" method="get"><input type="hidden" name="UI" value="UF-000-00_00-00-00-00-00-00_0"><input type="hidden" name="MA" value="02:00:00:00:00:01"><input type="hidden" name="SIP" value="10.0.0.2"><input type="hidden" name="OS" value=\'\'><input type="hidden" name="RN" value=""><input type="submit" value="continue"></form><script>document.redirect.submit();</script>'%s.base())
+    if p=='/roaming/mikrotikgateway/': return s.send(302,'',{'Location':s.base()+'/portal-system/portal/?ORG=1234&ui=%s&ma=%s'%(s.q().get('UI',[''])[0],s.q().get('MA',[''])[0])})
+    if p=='/portal-system/portal/': return s.send(200,'<html><head><script type="module" src="/portal-system/portal/assets/index-x.js"></script></head><body><div id="root"></div></body></html>')
+    if p.startswith('/ElevenOS/WebApi/portal/'): return s.send(200,'{"LandingPageUrl":"http://example.com","path":"%s"}'%p)
+    s.send(404,'')
 def opn(s,m,p,st):
     if p=='/index.html': return s.send(200,'<script src="/js/captiveportal.js"></script><div id="login"></div>')
     if p=='/api/captiveportal/access/logon/1' and m=='POST': st['ok']=True; return s.send(200,'{"clientState":"AUTHORIZED"}')
     s.send(404,'')
 SC={8701:dict(h=accept,start='/portal'),8702:dict(h=room,start='/start'),8703:dict(h=meraki,start='/start'),8704:dict(h=wlc,start='/start'),
-    8705:dict(h=jsonly,start='/'),8706:dict(h=voucher,start='/'),8707:dict(h=mikrotik,start='/start'),8001:dict(h=opn,start='/index.html?redirurl=x')}
+    8705:dict(h=jsonly,start='/'),8706:dict(h=voucher,start='/'),8707:dict(h=mikrotik,start='/start'),8708:dict(h=elevenos,start='/start'),8001:dict(h=opn,start='/index.html?redirurl=x')}
 for port,sc in SC.items():
     srv=http.server.ThreadingHTTPServer(('127.0.0.1',port),S); srv.sc=sc; srv.st={}
     threading.Thread(target=srv.serve_forever,daemon=True).start()

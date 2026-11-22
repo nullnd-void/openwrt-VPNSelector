@@ -5,7 +5,8 @@
 #   vpn-portal-login            try to log in; exit 0 once the uplink is online
 #   vpn-portal-login capture    only save the portal's pages for later
 #
-# It knows a few portal systems (Meraki, Cisco WLC, OPNsense, MikroTik trial)
+# It knows a few portal systems (Meraki, Cisco WLC, OPNsense, MikroTik trial,
+# and recognises ElevenOS without logging in to it yet)
 # and otherwise fills in the page's form: ticks the terms box, keeps hidden
 # fields, and enters surname, room and e-mail from /etc/config/vpnregions.
 # A portal it can't get through is saved under /root/portal-captures, so a
@@ -36,6 +37,14 @@ else
   bssid="$(iwinfo "$dev" info 2>/dev/null | sed -n 's/.*Access Point: \([0-9A-Fa-f:]*\).*/\1/p')"
 fi
 [ -n "$dev" ] || { echo "uplink is not connected"; exit 1; }
+
+# One run at a time: the failover cron and the LuCI buttons can start this
+# together, and runs sharing $WORK mix up each other's pages and captures.
+if command -v flock >/dev/null; then
+  exec 9> "${WORK}.lock"
+  flock -n 9 || { [ "$MODE" = capture ] && flock -w 60 9; } ||
+    { echo "another portal login is still running"; exit 1; }
+fi
 
 log() { [ -n "$VPN_TEST" ] && echo "LOG $*" >&2 || logger -t vpn-portal-login "$*"; echo "# $*" >> "$WORK/trace"; }
 
@@ -212,6 +221,17 @@ vendor() {
   return 1
 }
 
+# ElevenOS (11os.com / guestinternet.com, used by Hilton, Wyndham, Accor and
+# others): the gateway sends the browser to secure.11os.com/roaming/..., which
+# redirects to a JavaScript app at <host>/portal-system/portal/?ORG=<number>.
+# The app reads its login methods from JSON under /ElevenOS/WebApi/portal/ and
+# logs in through POST <host>/proxy (a /Guest/Portal/CreateUserVia*JSONP call).
+elevenos() {
+  case "$URL" in */portal-system/portal*) ;; *) return 1 ;; esac
+  EOS_ORG="$(echo "$URL" | sed -n 's/.*[?&][Oo][Rr][Gg]\([Nn][Uu][Mm][Bb][Ee][Rr]\)\{0,1\}=\([0-9A-Za-z_-]*\).*/\2/p')"
+  return 0
+}
+
 # Captures are meant to be passed on, so take out the surname, room and
 # e-mail that were typed into forms (plain and URL-encoded) and cookie values.
 scrub() {
@@ -221,7 +241,7 @@ scrub() {
       if (tolower(l) ~ /^(set-)?cookie:/) { sub(/:.*/, ": <hidden>", l); print l; next }
       l = rep(l, c, "<e-mail>"); l = rep(l, ce, "<e-mail>")
       l = rep(l, a, "<surname>"); l = rep(l, ae, "<surname>")
-      if (l ~ /^-- data: / || l ~ /^== (GET|POST) /) { l = rep(l, "=" b "&", "=<room>&"); l = rep(l, "=" be "&", "=<room>&")
+      if (b != "" && (l ~ /^-- data: / || l ~ /^== (GET|POST) /)) { l = rep(l, "=" b "&", "=<room>&"); l = rep(l, "=" be "&", "=<room>&")
         if (b != "" && substr(l, length(l) - length(b)) == "=" b) l = substr(l, 1, length(l) - length(b)) "<room>" }
       print l }'
 }
@@ -230,10 +250,15 @@ capture() {
   # one capture per access point until the router restarts
   grep -qx "${bssid:-x}" /tmp/vpn-portal-captured 2>/dev/null && [ "$MODE" != capture ] && return
   echo "${bssid:-x}" >> /tmp/vpn-portal-captured
-  # JavaScript portals keep their logic in script files: save those too
-  for js in $(tr '\n' ' ' < "$WORK/page" | grep -o '<script[^>]*src=["'"'"'][^"'"'"']*' | sed 's/.*src=["'"'"']//' | head -n 5); do
+  # ElevenOS: its script files are generic, the portal's settings are not
+  if elevenos; then
+    if [ -n "$EOS_ORG" ]; then
+      for p in portal/config portal/org; do fetch "$(origin "$URL")/ElevenOS/WebApi/$p/$EOS_ORG"; done
+    fi
+  # other JavaScript portals keep their logic in script files: save those
+  else for js in $(tr '\n' ' ' < "$WORK/page" | grep -o '<script[^>]*src=["'"'"'][^"'"'"']*' | sed 's/.*src=["'"'"']//' | head -n 5); do
     fetch "$(absurl "$URL" "$js")"
-  done
+  done; fi
   mkdir -p "$CAPDIR"
   f="$CAPDIR/$(date +%Y%m%d-%H%M%S)-$(echo "${ssid:-unknown}" | tr -c 'A-Za-z0-9_-' _ | cut -c1-24).txt"
   { echo "Portal capture for later automation"
@@ -256,7 +281,23 @@ if [ "$CODE" = 200 ] && [ "$(tr -d ' \r\n' < "$WORK/page")" = success ]; then
   exit 0
 fi
 
-if [ "$MODE" = capture ]; then capture "captured on request"; exit 0; fi
+# A page that only submits itself (a MikroTik gateway handing over to an
+# external portal, say) is not the portal yet: follow it.
+autosubmit() {
+  grep -qi '\.submit()' "$WORK/page" || return 1
+  out="$(formfill)"; kind="$(echo "$out" | head -n 1 | cut -f1)"
+  dest="$(absurl "$URL" "$(echo "$out" | head -n 1 | cut -f2-)")"; body="$(echo "$out" | sed -n 2p)"
+  case "$kind" in
+    POST) fetch "$dest" "$body" ;;
+    GET) case "$dest" in *\?*) fetch "$dest&$body" ;; *) fetch "$dest?$body" ;; esac ;;
+    *) return 1 ;;
+  esac
+}
+
+if [ "$MODE" = capture ]; then
+  i=0; while [ "$i" -lt 3 ] && autosubmit; do i=$((i + 1)); done
+  capture "captured on request"; exit 0
+fi
 
 log "login page found at $URL"
 round=0; why=""; tried=""
@@ -276,6 +317,9 @@ while [ "$round" -lt 5 ]; do
       LINK) dest="$(absurl "$URL" "$target")"; log "following $dest"; fetch "$dest" ;;
       NEED) why="the page needs $target, which isn't set (surname/room/e-mail, or a password or voucher)"; break ;;
       *)
+        if elevenos; then
+          why="ElevenOS portal (organisation ${EOS_ORG:-unknown}), a JavaScript app this script can't log in to yet"; break
+        fi
         r="$(softredirect)"
         if [ -n "$r" ]; then fetch "$(absurl "$URL" "$r")"
         else why="no form on the page (probably a JavaScript-only portal)"; break; fi ;;
