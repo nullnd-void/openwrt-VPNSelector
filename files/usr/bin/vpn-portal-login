@@ -273,7 +273,7 @@ scrub() {
 capture() {
   # one capture per access point until the router restarts
   grep -qx "${bssid:-x}" /tmp/vpn-portal-captured 2>/dev/null && [ "$MODE" != capture ] && return
-  echo "${bssid:-x}" >> /tmp/vpn-portal-captured
+  [ "$MODE" = capture ] || echo "${bssid:-x}" >> /tmp/vpn-portal-captured
   # ElevenOS: its script files are generic, the portal's settings are not
   if elevenos; then
     if [ -n "$EOS_ORG" ]; then
