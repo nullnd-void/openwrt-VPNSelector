@@ -582,9 +582,25 @@ formfill() {
   }'
 }
 
+# ElevenOS hands the gateway login to autologin.html?switch_url=<gateway
+# login>&username=..&password=..&dst=..: the page posts every other parameter
+# to switch_url (or, for Ubiquiti, sends them in the address).
+autologin() {
+  sw="$(urldecode "$(qparam "$1" switch_url)")"
+  case "$sw" in http://*|https://*) ;; *) return 1 ;; esac
+  body="$(echo "${1#*\?}" | tr '&' '\n' | grep -v '^switch_url=' | tr '\n' '&' | sed 's/&$//')"
+  log "handing the login to the gateway at $(origin "$sw")"
+  case "$sw" in
+    *ubiquiti-auth.html*) fetch "$sw?$body" ;;
+    *) fetch "$sw" "$body" ;;
+  esac
+}
+
 # Known portal systems, recognised from the address bar
 vendor() {
   urls="$(cat "$WORK/urls")"
+  a="$(grep '/autologin\.html?.*switch_url=' "$WORK/urls" | tail -n 1)"
+  if [ -n "$a" ]; then autologin "$a"; return 0; fi
   g="$(for u in $urls; do qparam "$u" base_grant_url; done | head -n 1)"
   if [ -n "$g" ]; then
     c="$(for u in $urls; do qparam "$u" user_continue_url; done | head -n 1)"
@@ -639,7 +655,12 @@ eos_login() {
   body="{\"url\":\"https://secure.11os.com/Guest/Portal/CreateUserViaFree5JSONP\",\"data\":{\"UserMac\":\"$(jstr "$ma")\",\"UserIpOpt\":\"$(jstr "$sip")\",\"GatewayId\":\"$(jstr "$ui")\",\"LoginUrl\":\"\",\"PortalSessionId\":\"\",\"CalledStationId\":\"\",\"AuditSessionId\":\"\",\"AcctSessionId\":\"\",\"NasDeviceIp\":\"\",\"UserInfo\":\"$(jstr "$ua")\",\"LoginUser\":true,\"PasswordOpt\":\"\",\"PromoCodeOpt\":\"\",\"UserNameOpt\":\"\",\"Email\":\"\",\"MarketingContact\":\"$(jstr "$EMAIL,Guest,${SURNAME:-Guest}")\",\"MarketingOptIn\":false,\"ServicePlanCode\":\"$(jstr "$plan")\",\"ServiceQuantity\":\"1\",\"EwsKey\":\"$EOS_KEY\",\"callback\":\"proxy\"}}"
   log "ElevenOS portal (organisation $EOS_ORG), free plan $plan"
   fetch "$o/proxy" "$body" "application/json"
-  sleep 3   # the server tells the gateway; give it a moment
+  err="$(sed -n 's/.*"Error":"\([^"]*\)".*/\1/p' "$WORK/page")"
+  [ -n "$err" ] && { why="ElevenOS portal refused the login: $err"; return 1; }
+  # the reply names the page that logs the device in at the gateway
+  lp="$(sed -n 's/.*"LandingPageUrl":"\([^"]*\)".*/\1/p' "$WORK/page" | sed 's/\\u0026/\&/g; s#\\/#/#g')"
+  case "$lp" in *autologin.html\?*switch_url=*) autologin "$lp" ;; esac
+  sleep 3   # give the gateway a moment
   return 0
 }
 
