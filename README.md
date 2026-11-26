@@ -17,8 +17,9 @@ Tested on a Cudy TR3000 with OpenWrt 25.12 (apk), travelmate 2.4.9 and Proton VP
 - **Check now** and **Switch to next tunnel** run the script straight away.
 - **Wi-Fi uplink** shows travelmate's status. If travelmate's own VPN option is on, a button turns it off.
 - **Hotel Wi-Fi login.** When the uplink shows a login page, the router tries to sign in by itself while your devices stay blocked.
-  - It recognises Meraki, Cisco WLC, OPNsense and MikroTik trial logins.
-  - For other pages it fills in the form: it ticks the terms box and enters the surname, room number and e-mail you set on the page.
+  - It recognises Meraki, Cisco WLC, OPNsense, MikroTik trial and ElevenOS free-plan logins.
+  - Other portals it walks through like a person would, page by page: it follows redirects and frames, picks the button or link that says continue, accept, connect or free, ticks the terms box, chooses the free plan, and enters the surname, room number and e-mail you set on the page. When a page has nothing to click, it looks for the login call in the page's JavaScript. It checks for internet after every step and gives up after 12 steps or 90 seconds.
+  - It never fills in or submits a payment form, never ticks newsletter or marketing boxes, and sends nothing about you beyond those three settings.
   - It retries at most every 5 minutes per access point.
 - **Saved login pages.** A login page the router can't get through is saved to `/root/portal-captures`, with cookie values and the surname, room number and e-mail you entered taken out. One page is kept per access point, up to the newest 10. You can download them from the page so a login for that hotel can be added later. See [docs/portal-research.md](docs/portal-research.md).
 - **Manual login** opens the plain uplink for 5 minutes, with the VPN down, so a phone or laptop can sign in to a portal. It closes by itself, then the VPN comes back. Connections opened during the window are cut when it closes.
@@ -106,7 +107,7 @@ This removes the page, the scripts, the cron job and the dnsmasq setting. It lea
 - `files/` holds the files installed on the router, at their paths there.
 - `installer/head.sh` and `installer/tail.sh` are the installer steps before and after the files are written.
 - `tools/build-installer.sh` rebuilds `install.sh` from those. Run it after changing anything in `files/` or `installer/`, and commit both.
-- `test/mock-portals.py` runs fake captive portals on 127.0.0.1 for testing `vpn-portal-login`.
+- `test/mock-portals.py` runs fake captive portals on 127.0.0.1 for testing `vpn-portal-login`, and `test/run-tests.sh` runs the script against each of them (`VPN_DEV=127.0.0.1 test/run-tests.sh` outside Linux).
 
 ## License
 

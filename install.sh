@@ -405,26 +405,36 @@ cat > /usr/bin/vpn-portal-login <<'VPNREGIONS_EOF'
 #   vpn-portal-login capture    only save the portal's pages for later
 #
 # It knows a few portal systems (Meraki, Cisco WLC, OPNsense, MikroTik trial,
-# ElevenOS free plans)
-# and otherwise fills in the page's form: ticks the terms box, keeps hidden
-# fields, and enters surname, room and e-mail from /etc/config/vpnregions.
+# ElevenOS free plans). Any other portal gets a generic walk through its
+# pages, like a person clicking through: on each page it picks the most
+# promising way on (a meta or script redirect, a frame, a form, a button or
+# link that says continue / accept / connect / free), submits forms with the
+# terms box ticked, the free plan chosen and surname, room and e-mail from
+# /etc/config/vpnregions filled in, and checks the uplink after every step.
+# When a page offers nothing else it looks for a login call in the page's
+# JavaScript. It never fills in or submits a payment form, never ticks
+# newsletter or marketing boxes, and sends nothing personal beyond those
+# three settings. It stops after $STEPS steps or $BUDGET seconds.
 # A portal it can't get through is saved under /root/portal-captures, so a
 # login for it can be written later.
 
-export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin${VPN_TEST:+:$PATH}"   # tests may bring their own curl
 MODE="$1"
 [ -n "$VPN_TEST" ] || . /lib/functions.sh
 
 PROBE="${VPN_PROBE:-http://detectportal.firefox.com/success.txt}"   # answers "success"
 CAPDIR="${VPN_CAPDIR:-/root/portal-captures}"
 KEEP=10                       # captures kept
+STEPS="${VPN_STEPS:-12}"      # pages or actions tried per run
+BUDGET="${VPN_BUDGET:-90}"    # seconds per run (cron waits for it)
+SEP="$(printf '\037')"        # field separator in the candidate lists
 WORK="${VPN_WORK:-/tmp/vpn-portal-login}"
 DNSAUTO="/tmp/resolv.conf.d/resolv.conf.auto"
 UA="Mozilla/5.0 (X11; Linux x86_64; rv:144.0) Gecko/20100101 Firefox/144.0"
 
 if [ -n "$VPN_TEST" ]; then
   UPLINK=wwan; SURNAME="$VPN_SURNAME"; ROOM="$VPN_ROOM"; EMAIL="$VPN_EMAIL"
-  dev="$VPN_DEV"; ssid=test; bssid=test
+  dev="$VPN_DEV"; ssid=test; bssid="${VPN_BSSID:-test}"
 else
   config_load vpnregions
   config_get UPLINK main uplink wwan
@@ -491,9 +501,10 @@ qparam() { echo "$1" | sed -n "s/.*[?&]$2=\([^&#]*\).*/\1/p"; }
 
 # fetch URL [POSTDATA [CONTENT-TYPE]]: follow redirects by hand (each host resolved through
 # the uplink's DNS), log everything for a capture, leave the final page in
-# $WORK/page and its address in $URL.
+# $WORK/page and its address in $URL. Given POSTDATA, even empty, it POSTs.
 fetch() {
   url="$1"; data="$2"; ctype="${3:-application/x-www-form-urlencoded}"; n=0
+  post=""; [ $# -ge 2 ] && post=1
   while :; do
     # the address comes from the portal: web addresses only, never file:// or
     # something curl would read as an option
@@ -501,9 +512,9 @@ fetch() {
     n=$((n + 1)); host="$(urlhost "$url")"; port="$(urlport "$url")"; ip="$(resolve "$host")"
     set -- -sk -m 15 --proto =http,https --interface "$dev" -A "$UA" -b "$JAR" -c "$JAR" -D "$WORK/hdr" -o "$WORK/page"
     [ -n "$ip" ] && [ "$ip" != "$host" ] && set -- "$@" --resolve "$host:$port:$ip"
-    [ -n "$data" ] && set -- "$@" --data "$data" -H "Content-Type: $ctype"
+    [ -n "$post" ] && set -- "$@" --data-raw "$data" -H "Content-Type: $ctype"
     code="$(curl "$@" -w '%{http_code}' "$url" 2>/dev/null)"
-    { echo; echo "== $([ -n "$data" ] && echo POST || echo GET) $url -> $code"; [ -n "$data" ] && echo "-- data: $data"
+    { echo; echo "== $([ -n "$post" ] && echo POST || echo GET) $url -> $code"; [ -n "$post" ] && echo "-- data: $data"
       cat "$WORK/hdr" 2>/dev/null; head -c 60000 "$WORK/page" 2>/dev/null; echo; } >> "$WORK/trace"
     echo "$url" >> "$WORK/urls"
     URL="$url"; CODE="$code"
@@ -511,7 +522,7 @@ fetch() {
     case "$code" in 30[1278]) ;; *) return 0 ;; esac
     [ -n "$loc" ] && [ "$n" -lt 10 ] || return 0
     url="$(absurl "$url" "$loc")"
-    [ "$code" = 307 ] || [ "$code" = 308 ] || data=""
+    [ "$code" = 307 ] || [ "$code" = 308 ] || { data=""; post=""; }
   done
 }
 
@@ -520,21 +531,35 @@ online() {
     [ "$(tr -d ' \r\n' < "$WORK/probe")" = success ]
 }
 
-# meta refresh or a JavaScript redirect on the current page
-softredirect() {
-  tr '\n\r' '  ' < "$WORK/page" | awk '{
-    l=tolower($0)
-    if (match(l, /http-equiv=["'"'"']?refresh["'"'"']?[^>]*url=[^"'"'"'>]+/)) { s=substr($0,RSTART,RLENGTH); sub(/.*[Uu][Rr][Ll]=/,"",s); print s; exit }
-    if (match($0, /(window\.|document\.|top\.)?location(\.href)? *= *["'"'"'][^"'"'"']+/)) { s=substr($0,RSTART,RLENGTH); sub(/^[^"'"'"']*["'"'"']/,"",s); print s; exit }
-    if (match($0, /location\.replace\( *["'"'"'][^"'"'"']+/)) { s=substr($0,RSTART,RLENGTH); sub(/^[^"'"'"']*["'"'"']/,"",s); print s; exit }
-  }' | sed 's/&amp;/\&/g'
-}
+# Word lists shared by the page and script readers (awk functions). A label
+# is the visible text, value, title and so on of a button, link or option.
+AWKLIB='
+function lc(s) { return tolower(s) }
+function ent(s) { gsub(/&nbsp;|&#160;/, " ", s); gsub(/&quot;|&#0?34;/, "\"", s); gsub(/&#0?39;|&apos;/, "\047", s); gsub(/&lt;/, "<", s); gsub(/&gt;/, ">", s); gsub(/&amp;/, "\\&", s); return s }
+function enc(s,   i, c, r) { r = ""; for (i = 1; i <= length(s); i++) { c = substr(s, i, 1); r = r (c ~ /[A-Za-z0-9._~-]/ ? c : sprintf("%%%02X", ord[c])) } return r }
+function clean(s) { s = ent(s); gsub(/[[:cntrl:]]/, " ", s); gsub(/  +/, " ", s); sub(/^ /, "", s); sub(/ $/, "", s); return substr(s, 1, 60) }
+function isfree(s) { return lc(s) ~ /free|gratuit|gratis|kostenlos|complimentary|0[.,]00/ }
+function ispaid(s) { s = lc(s); if (isfree(s)) return 0
+  return s ~ /(^|[^a-z])(pay|payment|purchase|buy|checkout|premium|upgrade|paid|subscribe|subscription|kaufen|bezahlen|payer|paiement|acheter|comprar|pagar|acquista)([^a-z]|$)|credit card|creditcard|kreditkarte|carte bancaire|tarjeta|\$ ?[0-9]|€|£|¥|(usd|eur|gbp|chf|aud|cad) ?[0-9]|[0-9] ?(usd|eur|gbp|chf|aud|cad)|stripe|paypal|adyen|braintree/ }
+function payurl(s) { return lc(s) ~ /stripe|paypal|adyen|braintree|checkout|payment|purchase|(^|\/)(pay|buy)([\/?.]|$)/ }
+function isdecline(s) { return lc(s) ~ /decline|reject|disagree|do not accept|don.t accept|not accept|refuse|cancel|ablehnen|refuser|rechazar|disconnect|log ?out|sign ?out|abmelden|(^|[^a-z])back([^a-z]|$)|zur(ü|u)ck|retour/ }
+function strong(s) { return lc(s) ~ /free|gratuit|gratis|kostenlos|complimentary|accept|agree|akzept|zustimm|aceptar|connect|verbinden|conectar|connexion|get online|go online|continu|weiter/ }
+function isgood(s) { return strong(s) || lc(s) ~ /proceed|online|get started|start|log ?in|sign ?in|anmelden|einloggen|enter|skip|no thanks|not now|next|surf|browse|internet|access|join|submit|^ok$|^go( |$)/ }
+function isview(s) { return lc(s) ~ /terms|privacy|policy|condition|cookie|impressum|imprint|legal|help|faq|support|contact|about|language|more info|learn more|read more|details|\.pdf/ }
+function social(s) { return lc(s) ~ /facebook|google|twitter|linkedin|instagram|apple|microsoft|wechat|tiktok/ }
+function marketing(s) { return lc(s) ~ /newsletter|marketing|offers|promo|partner|special|updates|subscribe|sms|advert|werbung|angebot|news/ }
+function terms(s) { return lc(s) ~ /term|agree|accept|tos|aup|condition|policy|consent|rule|disclaim|nutzungsbed|agb|cgu/ }
+function out(sc, kind, m, tgt, body, lab) { seq++; printf "%03d %04d\037%s\037%s\037%s\037%s\037%s\n", sc + 100, 9999 - seq, kind, m, tgt, body, clean(lab) }
+BEGIN { for (i = 0; i < 256; i++) ord[sprintf("%c", i)] = i; Q = "[\"\047`]"; NQ = "[^\"\047`]+" }
+'
 
-# Fill in the most promising form on the page. Prints "METHOD<TAB>action"
-# then the encoded body, or "NEED<TAB>field" when a required field can't be
-# filled.
-formfill() {
-  tr '\n\r\t' '   ' < "$WORK/page" | awk -v sn="$SURNAME" -v rm="$ROOM" -v em="$EMAIL" '
+# List the ways on from the current page, one per line: "score seq", kind,
+# method, target, body, label, separated by $SEP. Kinds: GO (a meta refresh,
+# script redirect, frame, or a link or button that leads somewhere), FORM, and
+# for information NEED (a form wants fields that aren't set) and PAY (a
+# payment form, skipped).
+analyze() {
+  tr '\n\r\t' '   ' < "$WORK/page" | awk -v sn="$SURNAME" -v rm="$ROOM" -v em="$EMAIL" "$AWKLIB"'
   function attr(t, n,   l, s) {
     l = tolower(t)
     if (match(l, "[ \t]" n "[ \t]*=[ \t]*\"[^\"]*\"")) { s = substr(t, RSTART, RLENGTH); sub(/^[^"]*"/, "", s); sub(/"$/, "", s); return ent(s) }
@@ -543,54 +568,178 @@ formfill() {
     return ""
   }
   function has(t, n) { return match(tolower(t), "[ \t]" n "([ \t=/>]|$)") }
-  function ent(s) { gsub(/&amp;/, "\\&", s); gsub(/&quot;/, "\"", s); gsub(/&#0?39;/, "\047", s); gsub(/&lt;/, "<", s); gsub(/&gt;/, ">", s); return s }
-  function enc(s,   i, c, r) { r = ""; for (i = 1; i <= length(s); i++) { c = substr(s, i, 1); r = r (c ~ /[A-Za-z0-9._~-]/ ? c : sprintf("%%%02X", ord[c])) } return r }
   function add(f, n, v) { if (n == "") return; body[f] = body[f] (body[f] == "" ? "" : "&") enc(n) "=" enc(v) }
-  BEGIN { for (i = 0; i < 256; i++) ord[sprintf("%c", i)] = i; nf = 0; f = 0 }
+  function after(k,   p) { p = parts[k]; if (!sub(/^[^>]*>/, "", p)) return ""; return p }
+  # text of element k up to its closing tag (or the next one of its kind)
+  function raw(k, ct,   j, s, p) { s = after(k)
+    for (j = k + 1; j <= nt && j < k + 40; j++) { p = tolower(parts[j]); if (index(p, "/" ct) == 1 || p ~ ("^" ct "[ \t>]") || (ct == "option" && p ~ /^\/select/)) break; s = s " " after(j) }
+    return s }
+  function inner(k, ct) { return clean(raw(k, ct)) }
+  # where a click handler would send the browser
+  function jsloc(s,   r) {
+    if (match(s, "location(\\.href)? *= *" Q NQ) || match(s, "location\\.(assign|replace)\\( *" Q NQ) || match(s, "window\\.open\\( *" Q NQ)) {
+      r = substr(s, RSTART, RLENGTH); sub("^[^\"\047`]*" Q, "", r); return ent(r) }
+    return ""
+  }
+  function linkscore(h, l,   all) {
+    if (h == "" || lc(h) ~ /^(javascript:|#|mailto:|tel:|about:|data:)/) return -1
+    if (h ~ /[?&]username=T-/ || lc(h) ~ /\/grant\?/) return 6
+    all = l " " h
+    if (ispaid(all) || payurl(h)) { paid = 1; return -1 }
+    if (isdecline(l) || social(all)) return -1
+    if (strong(l)) return 4
+    if (isgood(l) && !isview(l)) return 3
+    if (lc(h) ~ /accept|continue|agree|connect|grant|login|logon|free|auth/ && !isview(l)) return 2
+    return -1
+  }
+  # radio buttons and select options: the free one, else the preselected
+  # one, else the first; a group where every choice costs money is a payment
+  function choose(f, n, v, l, base,   s) {
+    if (ispaid(l)) s = -1; else if (isfree(l)) s = 3; else s = base
+    if (!((f, n) in cs) || s > cs[f, n]) { cs[f, n] = s; cv[f, n] = v }
+  }
   {
-    nt = split($0, parts, "<")
+    nt = split($0, parts, "<"); nf = 0; f = 0; sel = ""; scripts = ""
+    autosub = ($0 ~ /\.submit\( *\)/)
+    for (k = 2; k <= nt; k++) {
+      t = " " parts[k]; sub(/>.*/, "", t)
+      if (lc(t) ~ /^ label([ \t]|$)/) { fo = attr(t, "for"); if (fo != "") lab[fo] = inner(k, "label") }
+    }
     for (k = 2; k <= nt; k++) {
       t = " " parts[k]; sub(/>.*/, "", t); tag = tolower(t); sub(/^ /, "", tag); sub(/[ \t].*/, "", tag); if (tag !~ /^\//) sub(/\/.*/, "", tag)
-      if (tag == "form") { nf++; f = nf; act[f] = attr(t, "action"); meth[f] = toupper(attr(t, "method")); if (meth[f] == "") meth[f] = "GET"; continue }
+      if (tag == "script") { if (attr(t, "src") == "") scripts = scripts " " raw(k, "script"); continue }
+      if (tag == "meta") {
+        if (lc(attr(t, "http-equiv")) == "refresh" && match(lc(c = attr(t, "content")), /url *= */)) {
+          u = substr(c, RSTART + RLENGTH); gsub("^" Q "|" Q "$", "", u); if (u != "") out(8, "GO", "GET", u, "", "meta refresh") }
+        continue }
+      if (tag == "iframe" || tag == "frame") {
+        u = attr(t, "src")
+        if (u != "" && lc(u) !~ /^(about:|javascript:|data:)|doubleclick|googletag|analytics|youtube|vimeo|maps/ && !social(u)) out(3, "GO", "GET", u, "", tag)
+        continue }
+      if (tag == "form") { nf++; f = nf; act[f] = attr(t, "action"); meth[f] = toupper(attr(t, "method")); if (meth[f] != "POST") meth[f] = "GET"; if (payurl(act[f])) pay[f] = 1; continue }
       if (tag == "/form") { f = 0; continue }
-      if (tag == "option" && sel != "") { v = attr(t, "value"); if (!(sel in selv) || has(t, "selected")) selv[sel] = v; continue }
-      if (tag == "/select") { if (sel in selv) add(sf, sel, selv[sel]); sel = ""; continue }
-      if (f == 0 && tag != "a") continue
-      if (tag == "a") { h = attr(t, "href"); if (h ~ /[?&]username=T-/ || tolower(h) ~ /\/grant\?|accept|continue|agree|connect/) link = (link == "" ? h : link); continue }
+      if (tag == "option" && sel != "") { v = attr(t, "value"); ol = inner(k, "option"); if (!has(t, "value")) v = ol; choose(sf, sel, v, ol " " v, has(t, "selected") ? 2 : 1); continue }
+      if (tag == "/select") { sel = ""; continue }
+      if (tag == "a") {
+        h = attr(t, "href"); l = inner(k, "a") " " attr(t, "title") " " attr(t, "aria-label")
+        if (h == "" || lc(h) ~ /^(javascript:|#)/) { o = jsloc(attr(t, "onclick")); if (o != "") h = o }
+        if ((s = linkscore(h, l)) > 0) out(s, "GO", "GET", h, "", l)
+        continue }
+      # buttons and other elements that go somewhere when clicked
+      if (tag ~ /^(button|input|div|span|li|td|img|p|section|label)$/) {
+        o = jsloc(attr(t, "onclick")); if (o == "") o = attr(t, "data-href"); if (o == "") o = attr(t, "data-url")
+        if (o != "") { l = (tag == "input" ? attr(t, "value") : inner(k, tag)) " " attr(t, "aria-label") " " attr(t, "title")
+          if ((s = linkscore(o, l)) > 0) out(s, "GO", "GET", o, "", l) }
+      }
+      if (f == 0) continue
       if (tag == "select") { sel = attr(t, "name"); sf = f; continue }
       if (tag == "textarea") { add(f, attr(t, "name"), ""); continue }
       if (tag != "input" && tag != "button") continue
-      ty = tolower(attr(t, "type")); if (ty == "") ty = (tag == "button" ? "submit" : "text")
-      n = attr(t, "name"); v = attr(t, "value")
-      key = tolower(n " " attr(t, "id") " " attr(t, "placeholder") " " attr(t, "aria-label"))
+      ty = lc(attr(t, "type")); if (ty == "") ty = (tag == "button" ? "submit" : "text")
+      n = attr(t, "name"); v = attr(t, "value"); id = attr(t, "id"); lb = (id != "" && id in lab) ? lab[id] : ""
+      key = lc(n " " id " " attr(t, "placeholder") " " attr(t, "aria-label") " " attr(t, "autocomplete"))
+      near = lb " " clean(after(k))
       req = has(t, "required")
+      if (key ~ /card.?num|cc.?num|cc-|card.?holder|cvv|cvc|(^|[^a-z])csc|security.?code|expir|exp.?(month|year|date)|iban|creditcard|kreditkarte/) { pay[f] = 1; continue }
       if (ty == "hidden") { add(f, n, v); continue }
-      if (ty == "submit" || ty == "image") { if (!(f in sub_) && n != "") { sub_[f] = 1; add(f, n, v) } score[f] += 1; continue }
-      if (ty == "checkbox") { cbx[f]++; if (req || key ~ /term|agree|accept|tos|aup|condition|policy|consent|rule|disclaim/) { add(f, n, (v == "" ? "on" : v)); score[f] += 2 } else lone[f] = n "\t" v; continue }
-      if (ty == "radio") { if (!((f, n) in radio) || has(t, "checked")) radio[f, n] = v; continue }
-      if (ty == "button" || ty == "reset" || ty == "file") continue
-      if (key ~ /room|zimmer|chambre|habitaci|camera|kamer/) { fill = rm; score[f] += 3 }
-      else if (key ~ /surname|last.?name|lastname|family|nachname|apellido|nom de famille|cognome|achternaam/) { fill = sn; score[f] += 3 }
-      else if (key ~ /mail/) fill = em
-      else if (ty == "password" || key ~ /pass|voucher|code|pin|otp|token/) { fill = v; if (v == "") { pw[f] = n } }
-      else if (key ~ /(^| )(name|guest|gast)/) { fill = sn }
-      else fill = v
-      if (fill == "" && (req || ty == "password")) need[f] = need[f] (need[f] == "" ? "" : ",") n
+      if (ty == "submit" || ty == "image" || ty == "button") {
+        bl = (tag == "button" ? inner(k, "button") : v) " " attr(t, "aria-label") " " attr(t, "alt") " " attr(t, "title")
+        if (bl ~ /^ *$/) bl = n
+        if (ispaid(bl)) { bpaid[f] = 1; continue }
+        if (isdecline(bl)) continue
+        bs = strong(bl) ? 4 : isgood(bl) ? 3 : (ty == "button" ? 0 : 1)
+        if (!(f in bsc) || bs > bsc[f]) { bsc[f] = bs; bn[f] = (ty == "button" ? "" : n); bv[f] = v; blab[f] = bl }
+        continue }
+      if (ty == "checkbox") {
+        all = key " " near; cbx[f]++
+        if (marketing(all) && lc(all) !~ /term|condition|tos|aup|agb|cgu|nutzungsbed|rules/) { if (req) need[f] = need[f] (need[f] == "" ? "" : ",") "a marketing consent box" }
+        else if (terms(all) || req) { add(f, n, (v == "" ? "on" : v)); score[f] += 2 }
+        else lone[f] = n "\t" v
+        continue }
+      if (ty == "radio") { choose(f, n, v, v " " lb " " clean(after(k)), has(t, "checked") ? 2 : 1); continue }
+      if (ty == "reset" || ty == "file") continue
+      fill = v
+      if (key ~ /room|zimmer|chambre|habitaci|camera|kamer/) { fill = rm; if (rm != "") score[f] += 3 }
+      else if (key ~ /surname|last.?name|family|nachname|apellido|nom de famille|cognome|achternaam|lname/) { fill = sn; if (sn != "") score[f] += 3 }
+      else if (ty == "email" || key ~ /mail/) { fill = em; if (em != "") score[f] += 2 }
+      else if (ty == "password" || ty == "tel" || key ~ /pass|voucher|code|pin|otp|token|ticket|first|given|vorname|pr.nom|nombre|phone|mobile|tel/) fill = v
+      else if (key ~ /(^| )(name|guest|gast|full.?name)/) fill = sn
+      if (fill == "" && (req || ty == "password")) need[f] = need[f] (need[f] == "" ? "" : ",") (n != "" ? n : "a field")
       add(f, n, fill)
     }
+    # redirects in inline scripts (not in click handlers: those were scored above)
+    s = scripts; c = 0
+    while (c++ < 5 && (match(s, "location(\\.href)? *= *" Q NQ) || match(s, "location\\.(assign|replace)\\( *" Q NQ))) {
+      u = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH); sub("^[^\"\047`]*" Q, "", u); u = ent(u)
+      if (!ispaid(u) && !payurl(u) && lc(u) !~ /^(javascript:|#|about:)/) out(4, "GO", "GET", u, "", "script redirect") }
   }
   END {
-    best = 0; bs = -99
+    for (r in cs) { split(r, rr, SUBSEP); i = rr[1] + 0; if (i < 1) continue; if (cs[r] < 0) pay[i] = 1; else add(i, rr[2], cv[r]) }
     for (i = 1; i <= nf; i++) {
-      for (r in radio) { split(r, rr, SUBSEP); if (rr[1] == i) add(i, rr[2], radio[r]) }
       if (cbx[i] == 1 && lone[i] != "") { split(lone[i], lv, "\t"); add(i, lv[1], (lv[2] == "" ? "on" : lv[2])) }
-      s = score[i] - (i in need ? 10 : 0) - (tolower(act[i]) ~ /search|lang/ ? 5 : 0)
-      if (s > bs) { bs = s; best = i }
+      if (pay[i] || (bpaid[i] && !(i in bsc))) { out(0, "PAY", "", act[i], "", "payment form"); continue }
+      if (i in need) { out(0, "NEED", "", need[i], "", ""); continue }
+      if (i in bsc && bn[i] != "") add(i, bn[i], bv[i])
+      s = score[i] + (i in bsc ? bsc[i] : 0) + (autosub && nf == 1 ? 3 : 0) - (lc(act[i]) ~ /search|lang|locale/ ? 6 : 0)
+      if (s > 0) out(s, "FORM", meth[i], act[i], body[i], (i in blab ? blab[i] : "form"))
     }
-    if (best && (best in need) && link != "") { print "LINK\t" link; exit }
-    if (best && (best in need)) { print "NEED\t" need[best]; exit }
-    if (best) { print meth[best] "\t" act[best]; print body[best]; exit }
-    if (link != "") { print "LINK\t" link; exit }
+    if (paid) out(0, "PAY", "", "", "", "paid link")
+  }'
+}
+
+# Last resort for JavaScript portals: login calls (fetch, XMLHttpRequest,
+# jQuery, axios) in the page and its own scripts, to addresses that look like
+# a login, terms or connect endpoint. The request body holds only the keys the
+# call names that mean terms (true), e-mail, surname, name or room (from the
+# settings, when set), or that match a parameter of the page's own address.
+apiscan() {
+  q="$(echo "$URL" | sed -n 's/^[^?]*?\([^#]*\).*/\1/p')"
+  tr '\n\r\t' '   ' < "$WORK/js" | awk -v sn="$SURNAME" -v rm="$ROOM" -v em="$EMAIL" -v q="$q" "$AWKLIB"'
+  function dec(s,   r) { gsub(/\+/, " ", s); r = ""; while (match(s, /%[0-9A-Fa-f][0-9A-Fa-f]/)) { r = r substr(s, 1, RSTART - 1) hx[toupper(substr(s, RSTART + 1, 2))]; s = substr(s, RSTART + 3) } return r s }
+  function js(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); return s }
+  function url(s) { sub("^.*" Q, "", s); return s }
+  function mkbody(w, json,   s, k, lk, v, b, isb, ok) {
+    b = ""; s = w; split("", seen)
+    while (match(s, "[{,] *" Q "?[A-Za-z_][A-Za-z0-9_]*" Q "? *:")) {
+      k = substr(s, RSTART + 1, RLENGTH - 2); s = substr(s, RSTART + RLENGTH); gsub("[ \"\047`]", "", k)
+      lk = lc(k); if (lk in seen) continue; seen[lk] = 1
+      isb = 0; v = ""; ok = 1
+      if (lk ~ /^(e-?mail|mail|emailaddress|email_address|useremail|user_email|guestemail|guest_email)$/) { v = em; ok = (em != "") }
+      else if (lk ~ /last_?name|surname|family_?name|^lname$/) { v = sn; ok = (sn != "") }
+      else if (lk ~ /^(name|guestname|guest_name|fullname|full_name)$/) { v = sn; ok = (sn != "") }
+      else if (lk ~ /room/) { v = rm; ok = (rm != "") }
+      else if (lk ~ /terms|accept|agree|^tos$|aup|consent|eula|condition|disclaimer/ && !marketing(lk)) { v = "true"; isb = 1 }
+      else if (lk in qk) { v = qv[lk]; k = qk[lk] }
+      else ok = 0
+      if (!ok) continue
+      if (json) b = b (b == "" ? "" : ",") "\"" js(k) "\":" (isb ? "true" : "\"" js(v) "\"")
+      else b = b (b == "" ? "" : "&") enc(k) "=" enc(v)
+    }
+    return json ? "{" b "}" : b
+  }
+  function cand(u, m, w,   p, json) {
+    p = lc(u); sub(/[?#].*/, "", p)
+    if (p !~ /login|logon|auth|accept|agree|connect|grant|register|signup|signin|terms|free|access|session|guest|activate|online|allow|portal|captive|hotspot|wifi/) return
+    if (p ~ /\.(js|css|png|jpe?g|gif|svg|ico|woff2?|ttf|html?|map)$/ || p ~ /analytics|gtag|doubleclick|facebook|sentry|hotjar/ || payurl(p)) return
+    if ((m, u) in done) return; done[m, u] = 1
+    if (m == "GET") { if (p ~ /login|logon|auth|accept|agree|connect|grant|free|activate|allow/) out(1, "API", "GET", u, mkbody(w, 0), "page script"); return }
+    json = (lc(w) ~ /json/)
+    out(2, "API", json ? "POSTJSON" : "POST", u, mkbody(w, json), "page script")
+  }
+  BEGIN { for (i = 0; i < 256; i++) hx[sprintf("%02X", i)] = sprintf("%c", i)
+    n = split(q, qa, "&"); for (i = 1; i <= n; i++) { e = index(qa[i], "="); if (e < 2) continue; k = dec(substr(qa[i], 1, e - 1)); qk[lc(k)] = k; qv[lc(k)] = dec(substr(qa[i], e + 1)) } }
+  { s = $0
+    while (match(s, "fetch\\( *" Q NQ)) { w = substr(s, RSTART, 500); u = url(substr(s, RSTART, RLENGTH)); s = substr(s, RSTART + RLENGTH)
+      cand(u, (lc(w) ~ ("method *: *" Q "?post") ? "POST" : "GET"), w) }
+    s = $0
+    while (match(s, "(\\$|jQuery|axios)\\.(post|get|put)\\( *" Q NQ)) { w = substr(s, RSTART, 500); m = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH)
+      cand(url(m), (lc(m) ~ /\.get\(/ ? "GET" : "POST"), w) }
+    s = $0
+    while (match(s, "\\.open\\( *" Q "(post|get|POST|GET)" Q " *, *" Q NQ)) { w = substr(s, RSTART, 500); m = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH)
+      cand(url(m), (lc(m) ~ /post/ ? "POST" : "GET"), w) }
+    s = $0
+    while (match(s, "[{,] *" Q "?url" Q "? *: *" Q NQ)) { st = RSTART - 200; if (st < 1) st = 1; w = substr(s, st, 500); m = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH)
+      cand(url(m), (lc(w) ~ ("(type|method) *: *" Q "post") ? "POST" : "GET"), w) }
   }'
 }
 
@@ -729,13 +878,13 @@ fi
 # external portal, say) is not the portal yet: follow it.
 autosubmit() {
   grep -qi '\.submit()' "$WORK/page" || return 1
-  out="$(formfill)"; kind="$(echo "$out" | head -n 1 | cut -f1)"
-  dest="$(absurl "$URL" "$(echo "$out" | head -n 1 | cut -f2-)")"; body="$(echo "$out" | sed -n 2p)"
-  case "$kind" in
-    POST) fetch "$dest" "$body" ;;
-    GET) case "$dest" in *\?*) fetch "$dest&$body" ;; *) fetch "$dest?$body" ;; esac ;;
-    *) return 1 ;;
-  esac
+  l="$(analyze | sort -r | grep "${SEP}FORM${SEP}" | head -n 1)"
+  [ -n "$l" ] || return 1
+  IFS="$SEP" read -r pre kind meth target body label <<EOF
+$l
+EOF
+  dest="$(absurl "$URL" "$target")"
+  if [ "$meth" = POST ]; then fetch "$dest" "$body"; else fetch "${dest%%\?*}${body:+?$body}"; fi
 }
 
 if [ "$MODE" = capture ]; then
@@ -743,42 +892,95 @@ if [ "$MODE" = capture ]; then
   capture "captured on request"; exit 0
 fi
 
-log "login page found at $URL"
-round=0; why=""; tried=""; eos_tried=""
-while [ "$round" -lt 5 ]; do
-  round=$((round + 1))
-  if [ -z "$tried" ] && vendor; then tried=1
-  else
-    out="$(formfill)"
-    kind="$(echo "$out" | head -n 1 | cut -f1)"; target="$(echo "$out" | head -n 1 | cut -f2-)"
+# The page's own scripts (same site, the first few) next to the page itself,
+# in $WORK/js, for apiscan. Leaves $URL and the page as they were.
+gather_js() {
+  [ "$JSFOR" = "$URL" ] && return 0
+  JSFOR="$URL"; su="$URL"; sc="$CODE"; cp "$WORK/page" "$WORK/page.keep"; cp "$WORK/page" "$WORK/js"
+  for js in $(tr '\n' ' ' < "$WORK/page.keep" | grep -o '<script[^>]*src=["'"'"'][^"'"'"']*' | sed 's/.*src=["'"'"']//' | head -n 4); do
+    u="$(absurl "$su" "$js")"
+    [ "$(origin "$u")" = "$(origin "$su")" ] || continue
+    fetch "$u"; { echo; head -c 300000 "$WORK/page"; } >> "$WORK/js"
+  done
+  cp "$WORK/page.keep" "$WORK/page"; URL="$su"; CODE="$sc"
+}
+
+# A login call's reply often names the page to go to next
+apinext() {
+  nx="$(tr -d '\n\r' < "$WORK/page" | grep -oE '"[A-Za-z_]*([Rr]edirect|[Uu]rl|URL|[Ll]anding|[Ll]ocation|[Nn]ext|[Cc]ontinue)[A-Za-z_]*" *: *"[^"]*"' |
+    sed 's/^[^:]*: *"//; s/"$//; s#\\/#/#g; s/\\u0026/\&/g' | grep -E '^(https?:|/)' | head -n 1)"
+  [ -n "$nx" ] || return 0
+  log "step $step: following $nx from the login reply"
+  fetch "$(absurl "$URL" "$nx")"
+}
+
+# Take the best way on from list $1 that this run hasn't taken yet.
+pick() {
+  while IFS="$SEP" read -r pre kind meth target body label; do
     case "$kind" in
-      GET|POST)
-        body="$(echo "$out" | sed -n 2p)"
-        dest="$(absurl "$URL" "$target")"
-        log "submitting form to $dest"
-        if [ "$kind" = POST ]; then fetch "$dest" "$body"
-        else case "$dest" in *\?*) fetch "$dest&$body" ;; *) fetch "$dest?$body" ;; esac; fi ;;
-      LINK) dest="$(absurl "$URL" "$target")"; log "following $dest"; fetch "$dest" ;;
-      NEED) why="the page needs $target, which isn't set (surname/room/e-mail, or a password or voucher)"; break ;;
-      *)
-        if elevenos; then
-          if [ -z "$eos_tried" ]; then eos_tried=1; why=""
-            eos_login || break
-            for t in 1 2 3; do online && { log "logged in after $round step(s)"; exit 0; }; sleep 5; done
-            why="ElevenOS login sent, but the uplink is still offline"
-          fi
-          break
-        fi
-        r="$(softredirect)"
-        if [ -n "$r" ]; then fetch "$(absurl "$URL" "$r")"
-        else why="no form on the page (probably a JavaScript-only portal)"; break; fi ;;
+      NEED) case ",$NEEDS," in *",$target,"*) ;; *) NEEDS="${NEEDS:+$NEEDS,}$target" ;; esac; continue ;;
+      PAY) [ -n "$PAID" ] || log "skipping paid access ($label) on $URL"; PAID=1; continue ;;
     esac
+    dest="$(absurl "$URL" "$target")"
+    [ "$kind" = GO ] && [ "${dest%%#*}" = "${URL%%#*}" ] && continue
+    k="$(printf '%s %s %s %s' "$kind" "$meth" "$dest" "$body" | md5sum | cut -c1-32)"
+    grep -qx "$k" "$WORK/tried" && continue
+    echo "$k" >> "$WORK/tried"
+    case "$kind" in
+      FORM)
+        log "step $step: submitting the form \"$label\" to $dest"
+        if [ "$meth" = POST ]; then fetch "$dest" "$body"; else fetch "${dest%%\?*}${body:+?$body}"; fi ;;
+      API)
+        log "step $step: calling $dest from the page's script"
+        case "$meth" in
+          GET) [ -n "$body" ] && case "$dest" in *\?*) dest="$dest&$body" ;; *) dest="$dest?$body" ;; esac; fetch "$dest" ;;
+          POSTJSON) fetch "$dest" "$body" application/json ;;
+          *) fetch "$dest" "$body" ;;
+        esac
+        apinext ;;
+      *) log "step $step: following $dest${label:+ ($label)}"; fetch "$dest" ;;
+    esac
+    ACTED=1; return 0
+  done < "$1"
+  return 1
+}
+
+# One step of the generic walk; fails with $why set when nothing is left.
+next_step() {
+  analyze | sort -r > "$WORK/cands"
+  pick "$WORK/cands" && return 0
+  gather_js
+  apiscan | sort -r > "$WORK/api"
+  pick "$WORK/api" && return 0
+  if [ -n "$NEEDS" ]; then why="the page needs $NEEDS, which isn't set (surname/room/e-mail under Hotel Wi-Fi login, or a password or voucher)"
+  elif [ -n "$PAID" ]; then why="the portal only offers paid access (payment pages are never filled in)"
+  elif [ -z "$ACTED" ]; then why="no form, link or login call found on the page (probably a JavaScript-only portal)"
+  else why="nothing left to try on $URL"; fi
+  return 1
+}
+
+log "login page found at $URL"
+T0="$(date +%s)"; step=0; why=""; vtried=""; NEEDS=""; PAID=""; ACTED=""; JSFOR=""
+: > "$WORK/tried"
+while :; do
+  if [ "$step" -ge "$STEPS" ]; then why="still offline after $STEPS steps"; break; fi
+  if [ $(($(date +%s) - T0)) -ge "$BUDGET" ]; then why="still offline after $BUDGET seconds"; break; fi
+  step=$((step + 1))
+  if [ -z "$vtried" ] && vendor; then vtried=1
+  elif elevenos; then
+    eos_login || break
+    for t in 1 2 3; do online && { log "logged in after $step step(s)"; exit 0; }; sleep 5; done
+    why="ElevenOS login sent, but the uplink is still offline"; break
+  elif ! next_step; then
+    # the last step may need a moment to take effect at the gateway
+    if [ -n "$ACTED" ]; then for t in 1 2; do sleep 4; online && { log "logged in after $step step(s)"; exit 0; }; done; fi
+    break
   fi
-  if online; then log "logged in after $round step(s)"; exit 0; fi
+  if online; then log "logged in after $step step(s)"; exit 0; fi
 done
 
-capture "automatic login failed: ${why:-still offline after $round steps}"
-log "automatic login failed: ${why:-still offline}"
+capture "automatic login failed: $why"
+log "automatic login failed: $why"
 exit 1
 VPNREGIONS_EOF
 
