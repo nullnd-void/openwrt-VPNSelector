@@ -14,6 +14,9 @@ class S(http.server.BaseHTTPRequestHandler):
     def do_POST(self): self.route('POST')
     def route(self,m):
         sc=self.server.sc; st=self.server.st; path=self.p()
+        if path=='/state':   # what the portal saw, for test/run-tests.sh
+            import json; return self.send(200,json.dumps(st,default=str))
+        if path=='/reset': st.clear(); return self.send(200,'reset')
         if path=='/success.txt':
             return self.send(200,'success\n') if st.get('ok') else self.send(302,'',{'Location':self.base()+sc['start']})
         sc['h'](self,m,path,st)
@@ -70,8 +73,66 @@ def opn(s,m,p,st):
     if p=='/index.html': return s.send(200,'<script src="/js/captiveportal.js"></script><div id="login"></div>')
     if p=='/api/captiveportal/access/logon/1' and m=='POST': st['ok']=True; return s.send(200,'{"clientState":"AUTHORIZED"}')
     s.send(404,'')
+# --- unknown portals for the generic walk (placeholder values only) ---------
+def multistep(s,m,p,st):
+    # script redirect -> plan choice (paid one preselected) -> details form with
+    # a terms box named only by its label, a newsletter box, pay and free buttons
+    if p=='/start': return s.send(200,'<html><script>setTimeout(function(){ window.location.href = "/welcome?lang=en"; }, 100);</script>Loading...</html>')
+    if p=='/welcome': return s.send(200,'''<a href="/terms.html">Terms of use</a> <a href="/shop?plan=premium">Buy Premium 24h $9.99</a>
+      <form method="post" action="/plan"><input type="hidden" name="step" value="1">
+      <label><input type="radio" name="plan" value="p1" checked> Premium, 50 Mbit/s, EUR 4.99</label>
+      <label><input type="radio" name="plan" value="b1"> Basic (free)</label>
+      <button type="submit">Next</button></form>''')
+    if p=='/plan' and m=='POST':
+        f=s.form(); st['plan']=f.get('plan')
+        if f.get('plan')!=['b1']: return s.send(200,'wrong plan')
+        return s.send(302,'',{'Location':'/details?sid=77'})
+    if p=='/details': return s.send(200,'''<h1>Almost there</h1><form method="post" action="/connect">
+       <input type="hidden" name="sid" value="77"><input type="text" name="fname" placeholder="First name">
+       <input type="email" name="f2" required placeholder="you@example.com">
+       <input type="checkbox" name="c1" id="c1"><label for="c1">I have read and agree to the Terms of Use</label>
+       <input type="checkbox" name="c2" id="c2"><label for="c2">Send me news and special offers</label>
+       <button type="submit" name="action" value="pay">Upgrade to Premium &ndash; &euro;4.99</button>
+       <button type="submit" name="action" value="free">Connect for free</button></form>''')
+    if p=='/connect' and m=='POST':
+        f=s.form(); st['got']=f
+        st['ok']= f.get('sid')==['77'] and f.get('f2')==['guest@example.org'] and f.get('c1')==['on'] and 'c2' not in f and f.get('action')==['free'] and 'fname' not in f
+        return s.send(200,'<p>You are now connected.</p>')
+    if p=='/shop': st['shop']=True; return s.send(200,'<form method=post action=/pay><input name=cardnumber><input name=cvv><button>Pay</button></form>')
+    if p=='/pay': st['paid']=True; return s.send(200,'paid')
+    s.send(404,'')
+def paywall(s,m,p,st):
+    # paid access only: must never be submitted
+    if m=='POST': st['posted']=True; return s.send(200,'no')
+    if p=='/': return s.send(200,'''<h2>Wi-Fi access</h2><form method="post" action="/checkout"><select name="plan"><option value="h1">1 hour - $2.99</option><option value="d1">24 hours - $9.99</option></select>
+       <input name="card_number" autocomplete="cc-number" required><input name="exp" placeholder="MM/YY" required><input name="cvc" required>
+       <input type="checkbox" name="terms" required> I accept the terms <button type="submit">Buy now</button></form><a href="/terms">Terms</a>''')
+    s.send(200,'terms')
+def jsapi(s,m,p,st):
+    # JavaScript app: the login is a fetch() in its own script file
+    if p=='/start': return s.send(302,'',{'Location':'/portal/index.html?mac=02%3A00%3A00%3A00%3A00%3A09&ap=ap-1'})
+    if p=='/portal/index.html': return s.send(200,'<html><head><script src="/portal/js/main.js"></script><script src="http://cdn.example.invalid/lib.js"></script></head><body><div id="app"><input id="e"></div><button type="button" onclick="go()">Connect</button></body></html>')
+    if p=='/portal/js/main.js': return s.send(200,'var q=new URLSearchParams(location.search);fetch("/api/v2/config").then(function(r){return r.json()});\nfunction go(){fetch("/api/v2/guest/connect",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({mac:q.get("mac"),ap:q.get("ap"),acceptTerms:true,email:document.getElementById("e").value,newsletter:false})}).then(function(r){return r.json()}).then(function(j){location.href=j.redirectUrl})}\nfetch("http://stats.example.invalid/collect",{method:"POST"})')
+    if p=='/api/v2/guest/connect' and m=='POST':
+        import json; n=int(s.headers.get('Content-Length') or 0); j=json.loads(s.rfile.read(n)); st['got']=j
+        st['created']= j.get('mac')=='02:00:00:00:00:09' and j.get('ap')=='ap-1' and j.get('acceptTerms') is True and j.get('email')=='guest@example.org' and 'newsletter' not in j and s.headers.get('Content-Type','').startswith('application/json')
+        return s.send(200,'{"ok":true,"redirectUrl":"\\/portal\\/done"}')
+    if p=='/portal/done': st['ok']=bool(st.get('created')); return s.send(200,'done')
+    s.send(404,'')
+def frame(s,m,p,st):
+    # the portal sits in an iframe; its button is a div with a click handler
+    if p=='/': return s.send(200,'<html><body><iframe src="http://ads.doubleclick.net/x"></iframe><iframe src="/frame/login"></iframe></body></html>')
+    if p=='/frame/login': return s.send(200,'<a href="#" onclick="location.href=\'/frame/decline\'">Decline</a><div class="btn" onclick="window.location.href=\'/frame/grant?id=5\'">Get online now</div>')
+    if p=='/frame/grant': st['ok']=s.q().get('id')==['5'] and not st.get('declined'); return s.send(200,'ok')
+    if p=='/frame/decline': st['declined']=True; return s.send(200,'no')
+    s.send(404,'')
+def loop(s,m,p,st):
+    # never lets go: every answer is a new form; the run must stop on its own
+    st['n']=st.get('n',0)+1
+    s.send(200,'<form method="post" action="/next"><input type="hidden" name="t" value="%d"><input type="submit" value="Continue"></form>'%st['n'])
 SC={8701:dict(h=accept,start='/portal'),8702:dict(h=room,start='/start'),8703:dict(h=meraki,start='/start'),8704:dict(h=wlc,start='/start'),
-    8705:dict(h=jsonly,start='/'),8706:dict(h=voucher,start='/'),8707:dict(h=mikrotik,start='/start'),8708:dict(h=elevenos,start='/start'),8001:dict(h=opn,start='/index.html?redirurl=x')}
+    8705:dict(h=jsonly,start='/'),8706:dict(h=voucher,start='/'),8707:dict(h=mikrotik,start='/start'),8708:dict(h=elevenos,start='/start'),
+    8709:dict(h=multistep,start='/start'),8710:dict(h=paywall,start='/'),8711:dict(h=jsapi,start='/start'),8712:dict(h=frame,start='/'),8713:dict(h=loop,start='/'),8001:dict(h=opn,start='/index.html?redirurl=x')}
 for port,sc in SC.items():
     srv=http.server.ThreadingHTTPServer(('127.0.0.1',port),S); srv.sc=sc; srv.st={}
     threading.Thread(target=srv.serve_forever,daemon=True).start()

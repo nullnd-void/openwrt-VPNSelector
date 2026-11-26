@@ -16,6 +16,16 @@ Researched 2026-11-05. Hotel chains don't build their own portals; a few vendors
 | UniFi guest | `<ctrl>:8880/guest/s/default/?id=<mac>&url=` | older: POST `cmd=authenticate`; newer is JS | Low |
 | Aruba / ClearPass | URL with `cmd=login&mac=&switchip=` | POST `/cgi-bin/login`: `user`, `password`, `cmd=authenticate` | Low-medium |
 
+## Unknown portals: the generic walk
+
+For a portal none of the rules above recognise, `vpn-portal-login` acts like a person clicking through, one step at a time, and checks the uplink after each step (at most 12 steps or 90 seconds a run). On each page it lists every way on and takes the best one it hasn't taken yet:
+
+1. a meta refresh (strongest), then a redirect in an inline script, then a form or a link or clickable element (`onclick` with `location`, `data-href`) whose text says continue, accept, agree, connect, free, get online, log in, next (also in German, French and Spanish), then an iframe;
+2. forms keep their hidden fields, tick terms boxes (by name or by their `<label>` text), pick the free radio button or select option over a paid or preselected one, press the best-labelled submit button (`Connect for free` over `Upgrade for €4.99`), and fill surname, room and e-mail from the settings. A required field it has no value for (password, voucher, phone, first name) leaves the form out;
+3. when nothing on the page is left, it reads the page's own scripts (same site, first four) for `fetch`, `XMLHttpRequest.open`, `$.post`/`$.ajax` and `axios` calls to an address that looks like login/accept/connect/grant/terms. It sends those with only the keys the call names that mean terms (`true`), e-mail, surname/name or room, or that match a parameter of the page's own address (MAC, AP id and so on), as JSON when the call mentions JSON. A redirect address in the reply is followed.
+
+Never done: filling in or submitting a form with card, CVV, expiry or IBAN fields or a payment/checkout action; following a link or pressing a button that says pay, buy, premium, upgrade or shows a price; ticking newsletter or marketing boxes; decline, cancel, log-out or social sign-in links. A run that gets nowhere is saved as a capture, as before, with every step in the trace.
+
 Surname + room number (Marriott, Hilton, IHG style): no public documentation of field names; property-specific. Plan: a generic form parser that fills fields named like surname/last/name and room from per-stay values, ticks checkboxes, keeps hidden inputs, and submits.
 
 Design references: travelmate's own scripts ([README](https://git.openwrt.org/feed/packages/tree/net/travelmate/files/README.md)), [captive.d](https://github.com/janisstreib/captive.d), [captive-autologin](https://github.com/Onny2/captive-autologin).
